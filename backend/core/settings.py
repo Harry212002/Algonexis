@@ -30,6 +30,9 @@ INSTALLED_APPS = [
     'corsheaders',
 
     "user",
+    
+    "rest_framework",
+    "rest_framework_simplejwt",
 ]
 
 MIDDLEWARE = [
@@ -120,3 +123,8 @@ REST_FRAMEWORK = {
 CORS_ALLOW_ALL_ORIGINS = True
 
 AUTH_USER_MODEL = 'user.User'
+
+
+AUTHENTICATION_BACKENDS = [
+    'user.backends.EmailBackend',
+]
