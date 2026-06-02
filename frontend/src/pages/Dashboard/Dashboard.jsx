@@ -3,6 +3,8 @@ import { Routes, Route } from "react-router-dom";
 import Sidebar from "../../components/Sidebar/Sidebar";
 import { useAuth } from "../../context/AuthContext";
 import AddBrokerCredentials from "../UserPage/AddBrokerCredentials";
+import Bots from "../UserPage/Bots";
+
 import "./Dashboard.css";
 
 /* ── Placeholder sub-pages ── */
@@ -102,6 +104,9 @@ export default function Dashboard() {
             <Route index element={<Overview />} />
 
             <Route path="accounts" element={<AddBrokerCredentials />} />
+
+            <Route path="bots" element={<Bots />} />
+
             <Route
               path="analytics"
               element={<ComingSoon title="Analytics" />}

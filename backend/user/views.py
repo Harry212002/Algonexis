@@ -1,12 +1,12 @@
 from django.shortcuts import render
-from .models import User,AngelOneCredentials
+from .models import User,AngelOneCredentials,SectorMomentumBreakoutConfig
 from django.views import View
 from django.http import JsonResponse
 import json
 from django.views.decorators.csrf import csrf_exempt
 from rest_framework_simplejwt.tokens import AccessToken
 from .decorators import role_required
-
+from datetime import datetime
 
 @csrf_exempt
 def register(request):
@@ -323,6 +323,190 @@ def get_angelone_credentials(request):
                 }
             },
             status=200
+        )
+
+    except Exception as e:
+        return JsonResponse(
+            {
+                "success": False,
+                "message": str(e)
+            },
+            status=500
+        )
+        
+    
+@csrf_exempt
+@role_required("TRADER")
+def save_sector_momentum_config(request):
+    
+    if request.method not in ["POST","PUT"]:
+        return JsonResponse(
+            {
+                "success":False,
+                "message":"Invalida Request Mehtod"
+            },
+            status=405
+        )
+        
+    try:
+        
+        data=json.loads(request.body)
+        
+        config,created=SectorMomentumBreakoutConfig.objects.update_or_create(
+            user=request.user,
+            strategy_name="Sector Momentum Breakout",
+            defaults={
+
+                "broker": data.get("broker"),
+
+                "expiry_date": data.get("expiry_date"),
+
+                "strike_price": int(data.get("strike_price", 1)),
+
+                "entry_time": datetime.strptime(
+                    data.get("entry_time"),
+                    "%H:%M"
+                ).time(),
+
+                "exit_time": datetime.strptime(
+                    data.get("exit_time"),
+                    "%H:%M"
+                ).time(),
+
+                "trades_per_day": int(data.get("trades_per_day", 5)),
+
+                "fund_allocation": float(
+                    data.get("fund_allocation", 100000)
+                ),
+
+                "target_percentage": float(
+                    data.get("target_percentage", 5)
+                ),
+
+                "stoploss_percentage": float(
+                    data.get("stoploss_percentage", 2)
+                ),
+
+                "volume_multiplier": float(
+                    data.get("volume_multiplier", 3)
+                ),
+
+                "limit_multiplier": float(
+                    data.get("limit_multiplier", 1)
+                ),
+
+                "sectors_scan": int(
+                    data.get("sectors_scan", 3)
+                ),
+
+                "stocks_scan": int(
+                    data.get("stocks_scan", 3)
+                ),
+            }
+        )
+        
+        
+        return JsonResponse(
+            {
+                "success":True,
+                "message":"Configuration Saved",
+                "config_id": config.id
+            }
+        )
+        
+    except Exception as e:
+        return JsonResponse({
+            "success": False,
+            "message": str(e)
+        }, status=500)
+        
+        
+@csrf_exempt
+@role_required("TRADER")
+def get_sector_momentum_config(request):
+    
+    try:
+        
+        config=SectorMomentumBreakoutConfig.objects.get(
+            user=request.user,
+            strategy_name="Sector Momentum Breakout"
+        )
+        
+        return JsonResponse({
+            "success": True,
+            "data": {
+                "broker": config.broker,
+                "expiry_date": config.expiry_date,
+                "strike_price": config.strike_price,
+                "entry_time": config.entry_time.strftime("%H:%M"),
+                "exit_time": config.exit_time.strftime("%H:%M"),
+                "trades_per_day": config.trades_per_day,
+                "fund_allocation": config.fund_allocation,
+                "target_percentage": config.target_percentage,
+                "stoploss_percentage": config.stoploss_percentage,
+                "volume_multiplier": config.volume_multiplier,
+                "limit_multiplier": config.limit_multiplier,
+                "sectors_scan": config.sectors_scan,
+                "is_bot_running": config.is_bot_running,
+                "stocks_scan": config.stocks_scan
+            }
+        })
+        
+    except SectorMomentumBreakoutConfig.DoesNotExist:
+        return JsonResponse({
+            "success": False,
+            "message": "Config not found"
+        }, status=404)
+        
+        
+@csrf_exempt
+@role_required("TRADER")
+def toggle_sector_momentum_bot(request):
+
+    if request.method != "POST":
+        return JsonResponse(
+            {
+                "success": False,
+                "message": "Invalid request method"
+            },
+            status=405
+        )
+        
+    try:
+        
+        data=json.loads(request.body)
+        
+        is_bot_running=data.get("is_bot_running")
+        
+        config=SectorMomentumBreakoutConfig.objects.get(
+            user=request.user,
+            strategy_name="Sector Momentum Breakout"          
+        )
+        
+        config.is_bot_running = bool(is_bot_running)
+        config.save(update_fields=["is_bot_running"])
+
+        return JsonResponse(
+            {
+                "success": True,
+                "message": (
+                    "Bot started successfully"
+                    if config.is_bot_running
+                    else "Bot stopped successfully"
+                ),
+                "data": {
+                    "is_bot_running": config.is_bot_running
+                }
+            }
+        )
+
+    except SectorMomentumBreakoutConfig.DoesNotExist:
+        return JsonResponse(
+            {
+                "success": False,
+                "message": "Configuration not found. Please save configuration first."
+            },
+            status=404
         )
 
     except Exception as e:

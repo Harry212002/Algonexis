@@ -6,6 +6,7 @@ import "./Sidebar.css";
 const MENU = [
   { icon: "⬡", label: "Overview", to: "/dashboard" },
   { icon: "◈", label: "My Accounts", to: "/dashboard/accounts" },
+  { icon : "🤖", label: "Bots", to: "/dashboard/bots" },
   { icon: "◉", label: "Analytics", to: "/dashboard/analytics" },
   { icon: "◫", label: "Trades", to: "/dashboard/trades" },
   { icon: "◬", label: "Payouts", to: "/dashboard/payouts" },

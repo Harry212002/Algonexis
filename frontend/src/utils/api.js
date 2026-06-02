@@ -59,3 +59,16 @@ export const brokerApi = {
   getAngelOneCredentials: () => api.get("/users/angelone/credentials/get/"),
   saveAngelOneCredentials: (data) => api.post("/users/angelone/credentials/", data),
 };
+
+export const botApi = {
+  getSectorMomentumConfig: () =>
+    api.get("/users/sector-momentum/config/"),
+
+  saveSectorMomentumConfig: (data) =>
+    api.post("/users/sector-momentum/config/save/", data),
+
+  toggleSectorMomentumBot: (is_bot_running) =>
+    api.post("/users/sector-momentum/toggle/", {
+      is_bot_running,
+    }),
+};
