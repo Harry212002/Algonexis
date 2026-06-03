@@ -17,7 +17,7 @@ import pandas as pd
 from datetime import timedelta
 from django.utils import timezone
 
-logger = logging.getLogger('dev_log')
+logger = logging.getLogger('strategy_log')
 
 # -----------------------------------------------------------------------
 # Rate-limit guard (same constant as original)

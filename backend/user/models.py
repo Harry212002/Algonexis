@@ -3,57 +3,53 @@ from django.contrib.auth.models import AbstractUser
 from .managers import UserManager
 from django.conf import settings
 
-# Create your models here.
-
 
 class User(AbstractUser):
-    
+
     username = None
-    
-    
+
     ROLE_CHOICES = (
-        ("ADMIN","Admin"),
-        ("TRADER","Trader"),
+        ("ADMIN", "Admin"),
+        ("TRADER", "Trader"),
     )
-    
-    first_name=models.CharField(max_length=100)
-    last_name=models.CharField(max_length=100)
-    mobile_number=models.CharField(max_length=15,unique=True)
-    email=models.EmailField(unique=True)
-    role=models.CharField(max_length=20,choices=ROLE_CHOICES,default="TRADER")
-    is_active=models.BooleanField(default=True)
-    
-    USERNAME_FIELD="email"
-    REQUIRED_FIELDS=[]
-    
+
+    first_name = models.CharField(max_length=100)
+    last_name = models.CharField(max_length=100)
+    mobile_number = models.CharField(max_length=15, unique=True)
+    email = models.EmailField(unique=True)
+    role = models.CharField(max_length=20, choices=ROLE_CHOICES, default="TRADER")
+    is_active = models.BooleanField(default=True)
+
+    USERNAME_FIELD = "email"
+    REQUIRED_FIELDS = []
+
     objects = UserManager()
-    
+
     def __str__(self):
         return self.email
-    
-    
+
+
 class AngelOneCredentials(models.Model):
-    
-    user=models.OneToOneField(
+
+    user = models.OneToOneField(
         settings.AUTH_USER_MODEL,
         on_delete=models.CASCADE,
         related_name="angelone_account"
     )
-    
-    angel_api_key=models.CharField(max_length=200)
-    angel_client_code=models.CharField(max_length=50,unique=True)
-    angel_password=models.CharField(max_length=4)
-    angel_totp_secret=models.CharField(max_length=250)
-    
-    is_active=models.BooleanField(default=True)
-    created_at=models.DateTimeField(auto_now_add=True)
-    updated_at=models.DateTimeField(auto_now=True)
-    
+
+    angel_api_key = models.CharField(max_length=200)
+    angel_client_code = models.CharField(max_length=50, unique=True)
+    angel_password = models.CharField(max_length=4)
+    angel_totp_secret = models.CharField(max_length=250)
+
+    is_active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
     def __str__(self):
         return f"{self.user.email} - {self.angel_client_code}"
-    
-    
-    
+
+
 class OptionOrder(models.Model):
 
     STATUS_CHOICES = (
@@ -65,7 +61,11 @@ class OptionOrder(models.Model):
         ("REJECTED", "Rejected"),
     )
 
-    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="option_orders")
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="option_orders"
+    )
     strategy_name = models.CharField(max_length=200, db_index=True)
     order_id = models.CharField(max_length=100, blank=True, null=True)
     symbol = models.CharField(max_length=100)
@@ -95,9 +95,8 @@ class OptionOrder(models.Model):
 
     def __str__(self):
         return f"{self.full_symbol} - {self.order_id}"
-    
-    
-    
+
+
 class SectorMomentumBreakoutConfig(models.Model):
 
     EXPIRY_CHOICES = (
@@ -117,10 +116,7 @@ class SectorMomentumBreakoutConfig(models.Model):
         default="Sector Momentum Breakout"
     )
 
-    broker = models.CharField(
-        max_length=50,
-        default="angelone"
-    )
+    broker = models.CharField(max_length=50, default="angelone")
 
     expiry_date = models.CharField(
         max_length=50,
@@ -129,7 +125,6 @@ class SectorMomentumBreakoutConfig(models.Model):
     )
 
     strike_price = models.IntegerField(default=1)
-
     entry_time = models.TimeField()
     exit_time = models.TimeField()
 
@@ -142,8 +137,15 @@ class SectorMomentumBreakoutConfig(models.Model):
     sectors_scan = models.IntegerField(default=3)
     stocks_scan = models.IntegerField(default=3)
     is_active = models.BooleanField(default=True)
-    
     is_bot_running = models.BooleanField(default=False)
+
+    # --- Phase time overrides (optional per-config) ---
+    # If null, strategy engine uses its class-level defaults
+    phase1_start_time = models.TimeField(null=True, blank=True)
+    phase1_end_time = models.TimeField(null=True, blank=True)
+    phase2_start_time = models.TimeField(null=True, blank=True)
+    phase2_end_time = models.TimeField(null=True, blank=True)
+
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 

@@ -25,6 +25,11 @@ export default function Bots() {
     limit_multiplier: 1,
     sectors_scan: 3,
     stocks_scan: 3,
+
+    phase1_start_time: "09:15",
+    phase1_end_time: "09:20",
+    phase2_start_time: "09:20",
+    phase2_end_time: "15:15",
   });
   const [toast, setToast] = useState({
     show: false,
@@ -36,6 +41,18 @@ export default function Bots() {
   useEffect(() => {
     fetchConfig();
   }, []);
+
+  // useEffect(() => {
+  //   const interval = setInterval(async () => {
+  //     try {
+  //       const res = await botApi.getBotStatus();
+
+  //       setIsBotRunning(res.is_bot_running);
+  //     } catch (err) {}
+  //   }, 5000);
+
+  //   return () => clearInterval(interval);
+  // }, []);
 
   const fetchConfig = async () => {
     try {
@@ -58,6 +75,10 @@ export default function Bots() {
           limit_multiplier: response.data.limit_multiplier || 1,
           sectors_scan: response.data.sectors_scan || 3,
           stocks_scan: response.data.stocks_scan || 3,
+          phase1_start_time: response.data.phase1_start_time || "09:15",
+          phase1_end_time: response.data.phase1_end_time || "09:20",
+          phase2_start_time: response.data.phase2_start_time || "09:20",
+          phase2_end_time: response.data.phase2_end_time || "15:15",
         });
       }
     } catch (error) {
@@ -96,7 +117,10 @@ export default function Bots() {
       const response = await botApi.toggleSectorMomentumBot(newState);
 
       if (response.success) {
-        setIsBotRunning(newState);
+        if (response.success) {
+          await fetchConfig();
+          showToast(response.message, "success");
+        }
         showToast(
           newState ? "Bot started successfully!" : "Bot stopped successfully!",
           "success",
@@ -105,14 +129,7 @@ export default function Bots() {
         showToast(response.message || "Failed to toggle bot state", "error");
       }
     } catch (error) {
-      // Fallback for when toggle endpoint doesn't exist yet
-      setIsBotRunning(!isBotRunning);
-      showToast(
-        !isBotRunning
-          ? "Bot started successfully!"
-          : "Bot stopped successfully!",
-        "success",
-      );
+      showToast(error.message || "Failed to toggle bot", "error");
     } finally {
       setToggling(false);
     }
@@ -1407,6 +1424,142 @@ export default function Bots() {
                       e.target.style.borderColor = "rgba(0, 212, 255, 0.1)";
                       e.target.style.background = "rgba(255,255,255,0.04)";
                       e.target.style.boxShadow = "none";
+                    }}
+                  />
+                </div>
+
+                {/* Phase 1 Start Time */}
+                <div>
+                  <label
+                    style={{
+                      fontSize: "0.75rem",
+                      color: "var(--text-muted)",
+                      display: "block",
+                      marginBottom: "6px",
+                      fontFamily: "var(--font-body)",
+                      letterSpacing: "0.05em",
+                    }}
+                  >
+                    PHASE 1 START TIME
+                  </label>
+                  <input
+                    type="time"
+                    name="phase1_start_time"
+                    value={formData.phase1_start_time}
+                    onChange={handleInputChange}
+                    style={{
+                      width: "100%",
+                      background: "rgba(255,255,255,0.04)",
+                      border: "1px solid rgba(0, 212, 255, 0.1)",
+                      borderRadius: "10px",
+                      padding: "12px 16px",
+                      color: "var(--text-primary)",
+                      fontFamily: "var(--font-body)",
+                      fontSize: "1rem",
+                      transition: "all 0.25s cubic-bezier(0.4, 0, 0.2, 1)",
+                      outline: "none",
+                    }}
+                  />
+                </div>
+
+                {/* Phase 1 End Time */}
+                <div>
+                  <label
+                    style={{
+                      fontSize: "0.75rem",
+                      color: "var(--text-muted)",
+                      display: "block",
+                      marginBottom: "6px",
+                      fontFamily: "var(--font-body)",
+                      letterSpacing: "0.05em",
+                    }}
+                  >
+                    PHASE 1 END TIME
+                  </label>
+                  <input
+                    type="time"
+                    name="phase1_end_time"
+                    value={formData.phase1_end_time}
+                    onChange={handleInputChange}
+                    style={{
+                      width: "100%",
+                      background: "rgba(255,255,255,0.04)",
+                      border: "1px solid rgba(0, 212, 255, 0.1)",
+                      borderRadius: "10px",
+                      padding: "12px 16px",
+                      color: "var(--text-primary)",
+                      fontFamily: "var(--font-body)",
+                      fontSize: "1rem",
+                      transition: "all 0.25s cubic-bezier(0.4, 0, 0.2, 1)",
+                      outline: "none",
+                    }}
+                  />
+                </div>
+
+                {/* Phase 2 Start Time */}
+                <div>
+                  <label
+                    style={{
+                      fontSize: "0.75rem",
+                      color: "var(--text-muted)",
+                      display: "block",
+                      marginBottom: "6px",
+                      fontFamily: "var(--font-body)",
+                      letterSpacing: "0.05em",
+                    }}
+                  >
+                    PHASE 2 START TIME
+                  </label>
+                  <input
+                    type="time"
+                    name="phase2_start_time"
+                    value={formData.phase2_start_time}
+                    onChange={handleInputChange}
+                    style={{
+                      width: "100%",
+                      background: "rgba(255,255,255,0.04)",
+                      border: "1px solid rgba(0, 212, 255, 0.1)",
+                      borderRadius: "10px",
+                      padding: "12px 16px",
+                      color: "var(--text-primary)",
+                      fontFamily: "var(--font-body)",
+                      fontSize: "1rem",
+                      transition: "all 0.25s cubic-bezier(0.4, 0, 0.2, 1)",
+                      outline: "none",
+                    }}
+                  />
+                </div>
+
+                {/* Phase 2 End Time */}
+                <div>
+                  <label
+                    style={{
+                      fontSize: "0.75rem",
+                      color: "var(--text-muted)",
+                      display: "block",
+                      marginBottom: "6px",
+                      fontFamily: "var(--font-body)",
+                      letterSpacing: "0.05em",
+                    }}
+                  >
+                    PHASE 2 END TIME
+                  </label>
+                  <input
+                    type="time"
+                    name="phase2_end_time"
+                    value={formData.phase2_end_time}
+                    onChange={handleInputChange}
+                    style={{
+                      width: "100%",
+                      background: "rgba(255,255,255,0.04)",
+                      border: "1px solid rgba(0, 212, 255, 0.1)",
+                      borderRadius: "10px",
+                      padding: "12px 16px",
+                      color: "var(--text-primary)",
+                      fontFamily: "var(--font-body)",
+                      fontSize: "1rem",
+                      transition: "all 0.25s cubic-bezier(0.4, 0, 0.2, 1)",
+                      outline: "none",
                     }}
                   />
                 </div>

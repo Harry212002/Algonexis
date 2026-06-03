@@ -71,4 +71,7 @@ export const botApi = {
     api.post("/users/sector-momentum/toggle/", {
       is_bot_running,
     }),
+
+  getBotStatus: () =>
+    api.get("/users/sector-momentum/status/"),
 };

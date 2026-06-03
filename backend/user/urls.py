@@ -13,4 +13,5 @@ urlpatterns=[
     path("sector-momentum/config/save/",save_sector_momentum_config,name="save_sector_momentum_config"),
     path("sector-momentum/config/",get_sector_momentum_config,name="get_sector_momentum_config"),
     path("sector-momentum/toggle/",toggle_sector_momentum_bot,name="toggle_sector_momentum_bot"),
+    path("sector-momentum/status/",get_bot_status,name="get_bot_status"),
 ]

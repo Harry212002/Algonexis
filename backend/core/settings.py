@@ -131,3 +131,60 @@ AUTH_USER_MODEL = 'user.User'
 AUTHENTICATION_BACKENDS = [
     'user.backends.EmailBackend',
 ]
+
+
+import os
+
+LOG_DIR = BASE_DIR / "logs"
+os.makedirs(LOG_DIR, exist_ok=True)
+
+LOGGING = {
+    "version": 1,
+    "disable_existing_loggers": False,
+
+    "formatters": {
+        "standard": {
+            "format": "[{asctime}] [{levelname}] {name}: {message}",
+            "style": "{",
+        },
+    },
+
+    "handlers": {
+        "dev_file": {
+            "level": "INFO",
+            "class": "logging.FileHandler",
+            "filename": LOG_DIR / "dev.log",
+            "formatter": "standard",
+        },
+        "strategy_file": {
+            "level": "INFO",
+            "class": "logging.FileHandler",
+            "filename": LOG_DIR / "sector_momentum_strategy.log",
+            "formatter": "standard",
+        },
+        "console": {
+            "class": "logging.StreamHandler",
+            "formatter": "standard",
+        },
+    },
+
+    "loggers": {
+        "dev_log": {
+            "handlers": ["dev_file", "console"],
+            "level": "INFO",
+            "propagate": False,
+        },
+
+        "strategy_log": {
+            "handlers": ["strategy_file", "console"],
+            "level": "INFO",
+            "propagate": False,
+        },
+    },
+}
+
+
+ANGEL_API_KEY = os.getenv("ANGEL_API_KEY")
+ANGEL_CLIENT_CODE = os.getenv("ANGEL_CLIENT_CODE")
+ANGEL_JWT_TOKEN = os.getenv("ANGEL_JWT_TOKEN")
+ANGEL_FEED_TOKEN = os.getenv("ANGEL_FEED_TOKEN")
