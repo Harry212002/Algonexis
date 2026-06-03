@@ -195,6 +195,7 @@ class SectorMomentumBreakoutStrategy:
         if not os.path.exists(self.watchlist_csv):
             headers = [
                 "timestamp", "option_symbol", "stock_symbol", "option_type",
+                "previous_day_high","previous_day_date",
                 "five_min_high", "five_min_low", "five_min_close",
                 "five_min_volume", "avg_volume_20", "entry_signal",
                 "status", "stoploss",
@@ -591,6 +592,7 @@ class SectorMomentumBreakoutStrategy:
         today   = datetime.now().date()
         headers = [
             "timestamp", "option_symbol", "stock_symbol", "option_type",
+            "previous_day_high","previous_day_date",
             "five_min_high", "five_min_low", "five_min_close",
             "five_min_volume", "avg_volume_20", "entry_signal", "status", "stoploss",
         ]
@@ -1376,6 +1378,10 @@ class SectorMomentumBreakoutStrategy:
                     "option_symbol":   option_symbol,
                     "stock_symbol":    symbol,
                     "option_type":     option_type,
+                    
+                    "previous_day_high": prev_day_high,
+                    "previous_day_date": str(last_day),
+
                     "five_min_high":   first_candle["high"],
                     "five_min_low":    first_candle["low"],
                     "five_min_close":  first_candle["close"],
