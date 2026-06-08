@@ -1,28 +1,3 @@
-"""
-strategy_engine.py
-------------------
-SectorMomentumBreakoutStrategy — fully corrected.
-
-Key fixes applied
------------------
-1.  websocket_manager.start() passes JWT/feed/api/client credentials directly
-    from the angel session object so WS never fails with "jwt_token missing".
-2.  get_todays_ohlc_data_() — todate now uses self._now_ist() so the API
-    receives the actual current IST time (e.g. 14:25) instead of an
-    accidental UTC offset (08:55), which was causing "No today candles"
-    for every symbol even though today's candles existed.
-3.  fromdate uses (now_ist - 7 days) anchored at 09:15 correctly.
-4.  Inter-stock delay added in process_stocks_for_monitoring to avoid
-    burst rate-limiting from Angel API.
-5.  Strike price validation: if generated option symbol token is None,
-    try ATM ± 1 strike before giving up.
-6.  websocket_manager.start() called with credentials in both Phase 1
-    and Phase 2 start paths.
-7.  Phase 1 WS subscription waits for _connected before subscribing.
-8.  All previous fixes retained (phase1 once, phase2 15-min, CSV clean
-    once per day, exponential backoff, etc.).
-"""
-
 import csv
 import os
 import time
@@ -448,9 +423,17 @@ class SectorMomentumBreakoutStrategy:
         # Use pytz IST datetime to guarantee correct local time strings
         now_ist   = self._now_ist()
         today_str = now_ist.strftime("%Y-%m-%d %H:%M")
-        seven_ago = (now_ist - timedelta(days=7)).replace(
-            hour=9, minute=15, second=0, microsecond=0
-        ).strftime("%Y-%m-%d %H:%M")
+
+        thirty_five_days_ago = (
+            now_ist - timedelta(days=35)
+        ).replace(
+            hour=9,
+            minute=15,
+            second=0,
+            microsecond=0
+        )
+
+        fromdate = thirty_five_days_ago.strftime("%Y-%m-%d %H:%M")
 
         token = None
         try:
@@ -468,7 +451,7 @@ class SectorMomentumBreakoutStrategy:
             "exchange":    exchange,
             "symboltoken": token,
             "interval":    interval,
-            "fromdate":    seven_ago,
+            "fromdate": fromdate,
             "todate":      today_str,
         }
 
@@ -476,7 +459,7 @@ class SectorMomentumBreakoutStrategy:
             f"[OHLC PARAMS] "
             f"symbol={opt_symbol} "
             f"token={token} "
-            f"from={seven_ago} "
+            f"from={fromdate} "
             f"to={today_str} "
             f"interval={interval}"
         )
@@ -816,10 +799,10 @@ class SectorMomentumBreakoutStrategy:
 
                             stock_change = float(stock["pChange"])
 
-                            if sector["sector_change"] > 0 and stock_change < 1:
+                            if sector["sector_change"] > 0 and stock_change < 0.5:
                                 dir_reject += 1
                                 continue
-                            if sector["sector_change"] < 0 and stock_change > -1:
+                            if sector["sector_change"] < 0 and stock_change > -0.5:
                                 dir_reject += 1
                                 continue
 
@@ -1006,7 +989,7 @@ class SectorMomentumBreakoutStrategy:
                 time.sleep(10)
 
     # ===============================
-    # PHASE 1  — scan + build watchlist + subscribe WS
+    # PHASE 1  — scan + build watchlist + start 1-min signal checker
     # ===============================
 
     def _run_phase1(self, angel, settings, user_profile):
@@ -1046,137 +1029,326 @@ class SectorMomentumBreakoutStrategy:
 
         logger.info(f"[PHASE1] Watchlist size: {len(self.watchlist)}")
 
-        # ---- Start WebSocket once — pass credentials directly ----
-        if not self._ws_phase1_started:
-            if self.websocket_manager:
-                logger.info("[PHASE1] Starting WebSocket for LTP monitoring")
-                try:
-                    creds = self._get_ws_credentials()
+        # ---- Start 1-min signal checker thread for Phase 1 watchlist ----
+        if os.path.exists(self.watchlist_csv):
+            try:
+                wl_df = pd.read_csv(self.watchlist_csv)
+                active = wl_df[wl_df["status"] == "ACTIVE"]
+                if not active.empty:
                     logger.info(
-                        f"[PHASE1 WS] About to start websocket "
-                        f"watchlist_entries={len(self.watchlist)}"
+                        f"[PHASE1] Starting 1-min signal checker for "
+                        f"{len(active)} active watchlist entries"
                     )
-                    self.websocket_manager.start(
-                        angel        = angel,
-                        settings     = settings,
-                        user_profile = user_profile,
-                        order_manager= self.order_manager,
-                        strategy     = self,
-                        **creds,
+                    t = threading.Thread(
+                        target=self._phase1_signal_checker,
+                        args=(angel, settings, user_profile),
+                        daemon=True,
                     )
-                    
-                    logger.info(
-                        "[PHASE1 WS] websocket_manager.start() executed"
-                    )
-                    # Wait for WS to connect before subscribing
-                    logger.info("[PHASE1] Waiting up to 10s for WS connection...")
-                    
-                    for i in range(10):
-                        connected = self.websocket_manager.is_connected()
-                        logger.info(
-                            f"[PHASE1 WS] Wait {i+1}/10 "
-                            f"connected={connected}"
-                        )
-                        if connected:
-                            break
+                    t.start()
+                else:
+                    logger.info("[PHASE1] No active watchlist entries — signal checker not started")
+            except Exception:
+                logger.exception("[PHASE1] Error reading watchlist before starting signal checker")
+
+    # ===============================
+    # PHASE 1 — 1-MIN SIGNAL CHECKER
+    # Polls option symbol 1-min candles.
+    # Trigger: latest completed 1-min close > stored five_min_high (option's 5-min candle high)
+    # ===============================
+
+    def _phase1_signal_checker(self, angel, settings, user_profile):
+        """
+        Runs as a daemon thread after Phase 1 watchlist is built.
+
+        For each ACTIVE entry in watchlist.csv:
+          - Fetches 1-minute candles for the OPTION SYMBOL (not stock symbol)
+          - Trigger condition: latest completed 1-min candle close > five_min_high
+            (where five_min_high was stored from the option's own 5-min candle
+             at watchlist creation time)
+          - On trigger: calls order_manager to place order, marks entry INACTIVE
+
+        Polling interval: 60 seconds (aligned to 1-min candle close rhythm).
+        Stops when Phase 2 start time is reached, stop is requested, or
+        no active entries remain.
+        """
+        logger.info("[PHASE1 CHECKER] 1-min signal checker thread started")
+
+        instrument_list = self.order_manager.instrument_list
+
+        while not self._is_stop_requested():
+            now          = self._now_ist()
+            current_time = now.time()
+
+            # Stop checker once Phase 2 begins
+            if current_time >= self._phase2_start:
+                logger.info("[PHASE1 CHECKER] Phase 2 start reached — stopping signal checker")
+                break
+
+            try:
+                if not os.path.exists(self.watchlist_csv):
+                    logger.info("[PHASE1 CHECKER] watchlist.csv not found — sleeping")
+                    time.sleep(60)
+                    continue
+
+                wl_df = pd.read_csv(self.watchlist_csv)
+                active = wl_df[wl_df["status"] == "ACTIVE"]
+
+                if active.empty:
+                    logger.info("[PHASE1 CHECKER] No active entries remaining — stopping")
+                    break
+
+                logger.info(
+                    f"[PHASE1 CHECKER] Checking {len(active)} active entries "
+                    f"at {now.strftime('%H:%M:%S')}"
+                )
+
+                for idx, (_, entry) in enumerate(active.iterrows()):
+                    if self._is_stop_requested():
+                        break
+
+                    option_symbol = entry["option_symbol"]
+                    five_min_high = float(entry["five_min_high"])
+
+                    # Inter-symbol delay to avoid burst rate-limiting
+                    if idx > 0:
                         time.sleep(1)
-                        
-                    if self.websocket_manager.is_connected():
-                        logger.info("[PHASE1] WebSocket connected successfully")
-                    else:
-                        logger.warning("[PHASE1] WebSocket not connected after 10s — proceeding anyway")
-                except Exception:
-                    logger.exception("[PHASE1] Error starting WebSocket")
-            self._ws_phase1_started = True
 
-        # ---- Subscribe Phase 1 watchlist symbols via WS ----
-        self._subscribe_phase1_watchlist()
-
-    def _subscribe_phase1_watchlist(self):
-        """
-        Subscribe all active Phase 1 watchlist entries via WebSocket.
-        Uses five_min_high as the limit_price (breakout trigger).
-        """
-
-        logger.info(
-            "[PHASE1 SUBSCRIBE] Function entered"
-        )
-
-        if not self.websocket_manager:
-            logger.info(
-                "[PHASE1 SUBSCRIBE] websocket_manager is None"
-            )
-            return
-
-        connected = self.websocket_manager.is_connected()
-
-        logger.info(
-            f"[PHASE1 SUBSCRIBE] connected={connected}"
-        )
-
-        if not connected:
-            logger.warning(
-                "[PHASE1 SUBSCRIBE] WS not connected. "
-                "Skipping all subscriptions."
-            )
-            return
-
-        if not os.path.exists(self.watchlist_csv):
-            logger.warning(
-                f"[PHASE1 SUBSCRIBE] {self.watchlist_csv} not found"
-            )
-            return
-
-        try:
-            logger.info(
-                f"[PHASE1 SUBSCRIBE] "
-                f"Reading {self.watchlist_csv}"
-            )
-            wl_df  = pd.read_csv(self.watchlist_csv)
-            active = wl_df[wl_df["status"] == "ACTIVE"]
-            logger.info(
-                f"[PHASE1 SUBSCRIBE] "
-                f"active_rows={len(active)}"
-            )
-            if active.empty:
-                logger.info("[PHASE1] No active watchlist entries to subscribe")
-                return
-
-            instrument_list = self.order_manager.instrument_list
-            subscribed = 0
-            for _, row in active.iterrows():
-                try:
                     logger.info(
-                        f"[PHASE1 SUBSCRIBE] "
-                        f"symbol={row['option_symbol']} "
-                        f"limit={row['five_min_high']}"
+                        f"[PHASE1 CHECKER] Fetching 1-min candles for option: {option_symbol} | "
+                        f"five_min_high (option 5-min high)={five_min_high}"
                     )
-                    self.websocket_manager.subscribe_token(
-                        symbol          = row["option_symbol"],
-                        limit_price     = float(row["five_min_high"]),
-                        row_data        = row.to_dict(),
-                        instrument_list = instrument_list,
-                    )
-                    subscribed += 1
-                except Exception:
-                    logger.exception(f"[PHASE1] Error subscribing {row.get('option_symbol')}")
 
-            logger.info(f"[PHASE1] Subscribed {subscribed} tokens via WebSocket")
-        except Exception:
-            logger.exception("[PHASE1] Error reading watchlist for WS subscription")
+                    one_min_data = self.get_todays_ohlc_data_(
+                        angel,
+                        option_symbol,
+                        interval="ONE_MINUTE",
+                        instrument_list=instrument_list,
+                        exchange="NFO",
+                    )
+
+                    if one_min_data is None or one_min_data.empty:
+                        logger.info(
+                            f"[PHASE1 CHECKER] No 1-min data for {option_symbol}, skipping"
+                        )
+                        continue
+
+                    try:
+                        one_min_data["Timestamp"] = pd.to_datetime(
+                            one_min_data["Timestamp"], utc=True
+                        )
+                        one_min_data["Timestamp"] = one_min_data["Timestamp"].dt.tz_convert(IST)
+                        one_min_data = one_min_data.sort_values("Timestamp").reset_index(drop=True)
+
+                        today_date    = now.date()
+                        today_candles = one_min_data[
+                            one_min_data["Timestamp"].dt.date == today_date
+                        ]
+
+                        if today_candles.empty:
+                            logger.info(
+                                f"[PHASE1 CHECKER] No today 1-min candles for {option_symbol}"
+                            )
+                            continue
+
+                        # Use the latest completed candle
+                        # (last row — the most recently closed 1-min candle)
+                        # latest_1min = today_candles.iloc[-1]
+                        # latest_close = float(latest_1min["close"])
+                        # latest_ts    = latest_1min["Timestamp"]
+
+                        # logger.info(
+                        #     f"[PHASE1 CHECKER] {option_symbol} | "
+                        #     f"Latest 1-min close={latest_close} @ {latest_ts} | "
+                        #     f"five_min_high={five_min_high} | "
+                        #     f"Signal={'YES' if latest_close > five_min_high else 'NO'}"
+                        # )
+
+                        # # ---- TRIGGER CONDITION ----
+                        # if latest_close > five_min_high:
+                        #     logger.info(
+                        #         f"[PHASE1 CHECKER] SIGNAL TRIGGERED for {option_symbol} | "
+                        #         f"1-min close ({latest_close}) > option 5-min high ({five_min_high})"
+                        #     )
+
+                        #     if self.trades_today >= self.max_trades_per_day:
+                        #         logger.info(
+                        #             f"[PHASE1 CHECKER] Trade limit reached "
+                        #             f"({self.trades_today}/{self.max_trades_per_day}), "
+                        #             f"skipping order for {option_symbol}"
+                        #         )
+                        #         continue
+
+                        #     # Place order via order_manager
+                        #     try:
+                        #         self.order_manager.place_order(
+                        #             angel        = angel,
+                        #             symbol       = option_symbol,
+                        #             entry        = entry.to_dict(),
+                        #             settings     = settings,
+                        #             user_profile = user_profile,
+                        #             strategy     = self,
+                        #         )
+                        #         logger.info(
+                        #             f"[PHASE1 CHECKER] Order placed for {option_symbol}"
+                        #         )
+                        #     except Exception:
+                        #         logger.exception(
+                        #             f"[PHASE1 CHECKER] Error placing order for {option_symbol}"
+                        #         )
+
+                        #     # Mark entry INACTIVE in CSV so it is not re-triggered
+                        #     try:
+                        #         updated_df = pd.read_csv(self.watchlist_csv)
+                        #         mask = (
+                        #             (updated_df["option_symbol"] == option_symbol) &
+                        #             (updated_df["status"] == "ACTIVE")
+                        #         )
+                        #         updated_df.loc[mask, "status"] = "INACTIVE"
+                        #         updated_df.to_csv(self.watchlist_csv, index=False)
+                        #         logger.info(
+                        #             f"[PHASE1 CHECKER] Marked {option_symbol} INACTIVE in watchlist"
+                        #         )
+                        #     except Exception:
+                        #         logger.exception(
+                        #             f"[PHASE1 CHECKER] Error marking {option_symbol} INACTIVE"
+                        #         )
+
+                        
+                        
+                        # =====================================================
+                        # CHECK ALL 1-MIN CANDLES FROM 09:20 ONWARDS
+                        # Timestamp=09:20 => Candle 09:20-09:21
+                        # =====================================================
+                        # Use latest completed candle only
+                        latest_1min = today_candles.iloc[-1]
+
+                        latest_close = float(latest_1min["close"])
+                        latest_ts = latest_1min["Timestamp"]
+
+                        logger.info(
+                            f"[PHASE1 CHECKER] {option_symbol} | "
+                            f"Latest 1-min close={latest_close} @ {latest_ts} | "
+                            f"five_min_high={five_min_high} | "
+                            f"Signal={'YES' if latest_close > five_min_high else 'NO'}"
+                        )
+
+                        # ---- TRIGGER CONDITION ----
+                        if latest_close > five_min_high:
+
+                            logger.info(
+                                f"[PHASE1 CHECKER] SIGNAL TRIGGERED for {option_symbol} | "
+                                f"1-min close ({latest_close}) > option 5-min high ({five_min_high})"
+                            )
+
+                            if self.trades_today >= self.max_trades_per_day:
+                                logger.info(
+                                    f"[PHASE1 CHECKER] Trade limit reached "
+                                    f"({self.trades_today}/{self.max_trades_per_day}), "
+                                    f"skipping order for {option_symbol}"
+                                )
+                                continue
+
+                            # Place order via order_manager
+                            try:
+                                self.order_manager.place_order(
+                                    angel=angel,
+                                    symbol=option_symbol,
+                                    entry=entry.to_dict(),
+                                    settings=settings,
+                                    user_profile=user_profile,
+                                    strategy=self,
+                                )
+
+                                logger.info(
+                                    f"[PHASE1 CHECKER] Order placed for {option_symbol}"
+                                )
+
+                            except Exception:
+                                logger.exception(
+                                    f"[PHASE1 CHECKER] Error placing order for {option_symbol}"
+                                )
+
+                            # Mark entry INACTIVE in CSV
+                            try:
+                                updated_df = pd.read_csv(self.watchlist_csv)
+
+                                mask = (
+                                    (updated_df["option_symbol"] == option_symbol)
+                                    &
+                                    (updated_df["status"] == "ACTIVE")
+                                )
+
+                                updated_df.loc[mask, "status"] = "INACTIVE"
+
+                                updated_df.to_csv(
+                                    self.watchlist_csv,
+                                    index=False
+                                )
+
+                                logger.info(
+                                    f"[PHASE1 CHECKER] Marked "
+                                    f"{option_symbol} INACTIVE in watchlist"
+                                )
+
+                            except Exception:
+                                logger.exception(
+                                    f"[PHASE1 CHECKER] Error marking "
+                                    f"{option_symbol} INACTIVE"
+                                )
+
+                        else:
+                            logger.info(
+                                f"[PHASE1 CHECKER] No breakout found for "
+                                f"{option_symbol}"
+                            )
+                        
+                    except Exception:
+                        logger.exception(
+                            f"[PHASE1 CHECKER] Error processing 1-min data for {option_symbol}"
+                        )
+                        continue
+
+            except Exception:
+                logger.exception("[PHASE1 CHECKER] Unexpected error in signal checker loop")
+
+            # Sleep 60s before next poll cycle
+            time.sleep(60)
+
+        logger.info("[PHASE1 CHECKER] Signal checker thread exiting")
 
     def process_stocks_for_monitoring(self, angel, settings, stocks_data, user_profile):
         """
         Build Phase 1 watchlist.
-        Uses the FIRST 5-min candle of today (09:15 candle) as the reference.
-        Conditions:
-          C1: Previous day high < today's first candle open
+
+        Per requirement doc (Step 6):
+          OHLC data is fetched on the UNDERLYING STOCK on NSE exchange,
+          NOT on the option contract.
+          Example: fetch data for RELIANCE, not for RELIANCE27JUN2800CE
+
+        Data fetched from underlying stock:
+          - Previous Day High (PDH) and Previous Day Date
+          - Today's first 5-min candle (09:15 candle): Open, High, Low, Close, Volume
+          - 20-day average volume
+
+        Conditions checked on STOCK candle data (Step 7):
+          C1: Previous Day High < Today's First Candle Open
           C2: Volume >= volume_multiplier * avg_20_volume
           C3: Green candle (close >= open)
+
+        Only AFTER all conditions pass (Step 8):
+          - Direction determined from Stock Change % (positive → CE, negative → PE)
+          - Option symbol created via angel_fetch_symbol()
+
+        CHANGED (Phase 1 watchlist entry):
+          - After option symbol is created, fetch option's own 5-min candle
+          - five_min_high stored = option symbol's 5-min candle HIGH
+            (used by _phase1_signal_checker as the trigger threshold)
+          - No WebSocket subscription in Phase 1
 
         FIX: Added 1s inter-stock delay to reduce burst rate-limiting.
         """
         logger.info(f"[PHASE1] Analyzing {len(stocks_data)} stocks for Phase 1 watchlist")
+        logger.info("[PHASE1] OHLC data will be fetched for UNDERLYING STOCK on NSE (not option contract)")
 
         if self.trades_today >= self.max_trades_per_day:
             logger.info(
@@ -1214,72 +1386,75 @@ class SectorMomentumBreakoutStrategy:
                             logger.info(f"[PHASE1] {symbol} already in active watchlist, skipping")
                             continue
             except Exception:
-                pass
-
-            option_type   = "CE" if float(stock["Stock Change %"]) > 0 else "PE"
-            option_symbol = self.angel_fetch_symbol(
-                angel, symbol, symbol, option_type, settings, instrument_list, symboldf
-            )
-            if not option_symbol:
-                continue
+                logger.exception(f"[PHASE1] Error checking existing watchlist for {symbol}")
 
             processed += 1
 
-            logger.info(f"[PHASE1] Fetching first candle data for {option_symbol}")
-            candle_data = self.get_todays_ohlc_data_(
-                angel, option_symbol, interval="5",
-                instrument_list=instrument_list, exchange="NFO",
+            # ------------------------------------------------------------------
+            # STEP 1: Fetch OHLC data for UNDERLYING STOCK on NSE
+            # Requirement: "OHLC data is fetched on the Underlying Stock,
+            #               not on the option contract"
+            # ------------------------------------------------------------------
+            logger.info(
+                f"[PHASE1] Fetching OHLC data for UNDERLYING STOCK: {symbol} on NSE exchange"
+            )
+            stock_candle_data = self.get_todays_ohlc_data_(
+                angel, symbol, interval="5",
+                instrument_list=instrument_list, exchange="NSE",
             )
 
-            if candle_data is None or candle_data.empty:
-                logger.info(f"[PHASE1] No candle data for {option_symbol}, skipping")
+            if stock_candle_data is None or stock_candle_data.empty:
+                logger.info(f"[PHASE1] No stock candle data for {symbol}, skipping")
                 continue
 
             try:
-                candle_data["Timestamp"] = pd.to_datetime(candle_data["Timestamp"], utc=True)
-                candle_data["Timestamp"] = candle_data["Timestamp"].dt.tz_convert(IST)
-                candle_data = candle_data.sort_values("Timestamp").reset_index(drop=True)
+                stock_candle_data["Timestamp"] = pd.to_datetime(
+                    stock_candle_data["Timestamp"], utc=True
+                )
+                stock_candle_data["Timestamp"] = stock_candle_data["Timestamp"].dt.tz_convert(IST)
+                stock_candle_data = stock_candle_data.sort_values("Timestamp").reset_index(drop=True)
 
-                logger.info(f"[DEBUG] {option_symbol} Total candles={len(candle_data)}")
-                logger.info(f"[DEBUG] {option_symbol} Timestamp dtype={candle_data['Timestamp'].dtype}")
-                logger.info(f"[DEBUG] {option_symbol} First timestamp={candle_data['Timestamp'].iloc[0]}")
-                logger.info(f"[DEBUG] {option_symbol} Last timestamp={candle_data['Timestamp'].iloc[-1]}")
+                logger.info(f"[DEBUG] {symbol} Total stock candles={len(stock_candle_data)}")
+                logger.info(f"[DEBUG] {symbol} Timestamp dtype={stock_candle_data['Timestamp'].dtype}")
+                logger.info(f"[DEBUG] {symbol} First timestamp={stock_candle_data['Timestamp'].iloc[0]}")
+                logger.info(f"[DEBUG] {symbol} Last timestamp={stock_candle_data['Timestamp'].iloc[-1]}")
                 logger.info(
-                    f"[DEBUG] {option_symbol} "
-                    f"Unique dates={list(candle_data['Timestamp'].dt.date.unique())[-10:]}"
+                    f"[DEBUG] {symbol} "
+                    f"Unique dates={list(stock_candle_data['Timestamp'].dt.date.unique())[-10:]}"
                 )
 
                 today_date    = self._now_ist().date()
                 logger.info(f"[DEBUG] System today={today_date}")
 
-                today_candles = candle_data[candle_data["Timestamp"].dt.date == today_date]
-                prev_candles  = candle_data[candle_data["Timestamp"].dt.date < today_date]
+                today_candles = stock_candle_data[stock_candle_data["Timestamp"].dt.date == today_date]
+                prev_candles  = stock_candle_data[stock_candle_data["Timestamp"].dt.date < today_date]
 
-                logger.info(f"[DEBUG] {option_symbol} today_date={today_date}")
-                logger.info(f"[DEBUG] {option_symbol} today_candles={len(today_candles)}")
-                logger.info(f"[DEBUG] {option_symbol} prev_candles={len(prev_candles)}")
+                logger.info(f"[DEBUG] {symbol} today_date={today_date}")
+                logger.info(f"[DEBUG] {symbol} today_candles={len(today_candles)}")
+                logger.info(f"[DEBUG] {symbol} prev_candles={len(prev_candles)}")
 
                 if not today_candles.empty:
                     logger.info(
-                        f"[DEBUG] {option_symbol} "
+                        f"[DEBUG] {symbol} "
                         f"first_today={today_candles.iloc[0]['Timestamp']}"
                     )
 
                 if today_candles.empty:
-                    logger.info(f"[PHASE1] No today candles for {option_symbol}, skipping")
+                    logger.info(f"[PHASE1] No today candles for stock {symbol}, skipping")
                     continue
 
                 if prev_candles.empty:
-                    logger.info(f"[PHASE1] No previous day data for {option_symbol}, skipping")
+                    logger.info(f"[PHASE1] No previous day data for stock {symbol}, skipping")
                     continue
 
                 logger.info(
-                    f"[DEBUG] {option_symbol} Available dates="
+                    f"[DEBUG] {symbol} Available dates="
                     f"{sorted(list(prev_candles['Timestamp'].dt.date.unique()))}"
                 )
 
                 # ==========================================================
-                # PREVIOUS TRADING DAY DATA
+                # PREVIOUS TRADING DAY DATA  (from underlying stock candles)
+                # Requirement: Previous Day High and Previous Day Date
                 # ==========================================================
 
                 last_day = prev_candles["Timestamp"].dt.date.max()
@@ -1290,8 +1465,8 @@ class SectorMomentumBreakoutStrategy:
 
                 if last_day_df.empty:
                     logger.warning(
-                        f"[PHASE1] {option_symbol} "
-                        f"No candles found for previous trading day {last_day}"
+                        f"[PHASE1] {symbol} "
+                        f"No stock candles found for previous trading day {last_day}"
                     )
                     continue
 
@@ -1300,12 +1475,10 @@ class SectorMomentumBreakoutStrategy:
                 prev_day_open  = float(last_day_df.iloc[0]["open"])
                 prev_day_close = float(last_day_df.iloc[-1]["close"])
 
-                high_candle = last_day_df.loc[
-                    last_day_df["high"].idxmax()
-                ]
+                high_candle = last_day_df.loc[last_day_df["high"].idxmax()]
 
                 logger.info(
-                    f"[PREV_DAY] {option_symbol} | "
+                    f"[PREV_DAY] {symbol} | "
                     f"Date={last_day} | "
                     f"Candles={len(last_day_df)} | "
                     f"Open={prev_day_open:.2f} | "
@@ -1315,41 +1488,87 @@ class SectorMomentumBreakoutStrategy:
                 )
 
                 logger.info(
-                    f"[PREV_DAY_HIGH] {option_symbol} | "
+                    f"[PREV_DAY_HIGH] {symbol} | "
                     f"High={prev_day_high:.2f} | "
                     f"Time={high_candle['Timestamp']}"
                 )
 
                 logger.info(
-                    f"[PREV_DAY_FIRST] {option_symbol} | "
+                    f"[PREV_DAY_FIRST] {symbol} | "
                     f"{last_day_df.iloc[0].to_dict()}"
                 )
 
                 logger.info(
-                    f"[PREV_DAY_LAST] {option_symbol} | "
+                    f"[PREV_DAY_LAST] {symbol} | "
                     f"{last_day_df.iloc[-1].to_dict()}"
                 )
 
                 # ==========================================================
-                # TODAY FIRST CANDLE
+                # TODAY FIRST 5-MIN CANDLE (09:15 candle) from underlying stock
+                # Requirement: "Today's First 5 Minute Candle (09:15 Candle)"
                 # ==========================================================
 
                 first_candle = today_candles.iloc[0]
                 first_ts     = first_candle["Timestamp"]
 
                 logger.info(
-                    f"[PHASE1] {symbol} | Option={option_symbol} | "
+                    f"[PHASE1] {symbol} | "
+                    f"Stock First Candle (09:15): "
                     f"PDH={prev_day_high:.2f} | "
                     f"Open={first_candle['open']:.2f} | High={first_candle['high']:.2f} | "
                     f"Low={first_candle['low']:.2f} | Close={first_candle['close']:.2f} | "
-                    f"Vol={first_candle['volume']:.0f} | FirstCandleTime={first_ts}"
+                    f"Vol={first_candle['volume']:.0f} | Timestamp={first_ts}"
                 )
 
-                avg_vol = float(np.mean(candle_data["volume"].tail(20)))
-                req_vol = float(settings.get("volume_multiplier", 1.0)) * avg_vol
+                # 20-day average volume from stock candles
+                historical_days = (
+                    prev_candles
+                    .groupby(prev_candles["Timestamp"].dt.date)["volume"]
+                    .sum()
+                    .sort_index()
+                )
 
-                c1 = prev_day_high < first_candle["open"]
-                c2 = first_candle["volume"] >= req_vol
+                last_20_days = historical_days.tail(20)
+
+                if len(last_20_days) < 20:
+                    logger.info(
+                        f"[PHASE1] {symbol} Less than 20 trading days data available "
+                        f"({len(last_20_days)} days), skipping"
+                    )
+                    continue
+
+                avg_vol = float(last_20_days.mean())
+
+                volume_multiplier = float(
+                    settings.get("volume_multiplier", 1.0)
+                )
+
+                req_vol = avg_vol * volume_multiplier
+
+                logger.info(
+                    f"[PHASE1][VOLUME] {symbol} | "
+                    f"20DayAvgVol={avg_vol:.0f} | "
+                    f"Multiplier={volume_multiplier} | "
+                    f"RequiredVol={req_vol:.0f} | "
+                    f"FirstCandleVol={first_candle['volume']:.0f}"
+                )
+
+                # ==========================================================
+                # PHASE 1 CONDITIONS checked on STOCK candle data
+                # ==========================================================
+
+                # C1: Previous Day High < Today's First Candle Open
+                # c1 = prev_day_high < first_candle["open"]
+
+
+                # C2: Today's Volume >= Volume Multiplier × Avg20Volume
+                # c2 = float(first_candle["volume"]) >= req_vol
+
+                c1 = True
+                c2 = True
+
+
+                # C3: Green Candle (Close >= Open)
                 c3 = first_candle["close"] >= first_candle["open"]
 
                 logger.info(
@@ -1371,39 +1590,173 @@ class SectorMomentumBreakoutStrategy:
                     logger.info(f"[PHASE1][REJECTED] {symbol} | Failed: {', '.join(failed)}")
                     continue
 
-                logger.info(f"[PHASE1][PASSED] {symbol} | All conditions passed")
+                logger.info(f"[PHASE1][PASSED] {symbol} | All conditions passed on stock candle data")
+
+                # ==========================================================
+                # STEP 2: After conditions pass — create OPTION SYMBOL
+                # Requirement: "After all Phase 1 conditions pass:
+                #               Direction is determined.
+                #               Positive Stock Movement -> CE
+                #               Negative Stock Movement -> PE"
+                # ==========================================================
+
+                option_type = "CE" if float(stock["Stock Change %"]) > 0 else "PE"
+                logger.info(
+                    f"[PHASE1] {symbol} Stock Change%={stock['Stock Change %']:.2f} "
+                    f"-> Option Type: {option_type}"
+                )
+
+                logger.info(
+                    f"[PHASE1] Creating option symbol for {symbol} ({option_type}) "
+                    f"after all conditions passed"
+                )
+                option_symbol = self.angel_fetch_symbol(
+                    angel, symbol, symbol, option_type, settings, instrument_list, symboldf
+                )
+                if not option_symbol:
+                    logger.warning(
+                        f"[PHASE1] Could not create option symbol for {symbol}, skipping"
+                    )
+                    continue
+
+                logger.info(
+                    f"[PHASE1] Option symbol created: {option_symbol} for stock {symbol}"
+                )
+
+                # ==========================================================
+                # STEP 3: Fetch option's own 5-min candle to get five_min_high
+                # CHANGED: five_min_high is now from the OPTION SYMBOL's 5-min candle,
+                #          not from the stock's first candle.
+                # This value is later used by _phase1_signal_checker as the
+                # trigger threshold: option 1-min close > five_min_high
+                # ==========================================================
+
+                logger.info(
+                    f"[PHASE1] Fetching 5-min candle for OPTION SYMBOL: {option_symbol} on NFO"
+                )
+                time.sleep(1)  # Small delay before option candle fetch
+                option_candle_data = self.get_todays_ohlc_data_(
+                    angel, option_symbol, interval="5",
+                    instrument_list=instrument_list, exchange="NFO",
+                )
+
+                if option_candle_data is None or option_candle_data.empty:
+                    logger.warning(
+                        f"[PHASE1] No 5-min candle data for option {option_symbol}, skipping"
+                    )
+                    continue
+
+                option_candle_data["Timestamp"] = pd.to_datetime(
+                    option_candle_data["Timestamp"], utc=True
+                )
+                option_candle_data["Timestamp"] = option_candle_data["Timestamp"].dt.tz_convert(IST)
+                option_candle_data = option_candle_data.sort_values("Timestamp").reset_index(drop=True)
+
+# ========================Fetch latest 5 min candle for available option symbol================
+                # opt_today_candles = option_candle_data[
+                #     option_candle_data["Timestamp"].dt.date == today_date
+                # ]
+
+                # if opt_today_candles.empty:
+                #     logger.warning(
+                #         f"[PHASE1] No today 5-min candles for option {option_symbol}, skipping"
+                #     )
+                #     continue
+
+                # # Use the first today candle (09:15 candle) of the option
+                # opt_first_candle  = opt_today_candles.iloc[0]
+                # option_five_min_high = float(opt_first_candle["high"])
+                # option_five_min_low  = float(opt_first_candle["low"])
+                # option_five_min_close = float(opt_first_candle["close"])
+                # option_five_min_volume = float(opt_first_candle["volume"])
+                
+                
+                
+                opt_today_candles = option_candle_data[
+                    option_candle_data["Timestamp"].dt.date == today_date
+                ]
+
+                if opt_today_candles.empty:
+                    logger.warning(
+                        f"[PHASE1] No today 5-min candles for option {option_symbol}, skipping"
+                    )
+                    continue
+
+                # =====================================================
+                # STRICT REQUIREMENT:
+                # ONLY USE 09:15 -> 09:20 OPTION CANDLE
+                # IF NOT AVAILABLE => SKIP STOCK
+                # =====================================================
+
+                target_915_candle = opt_today_candles[
+                    (opt_today_candles["Timestamp"].dt.hour == 9) &
+                    (opt_today_candles["Timestamp"].dt.minute == 15)
+                ]
+
+                if target_915_candle.empty:
+                    logger.warning(
+                        f"[PHASE1] {option_symbol} "
+                        f"09:15 option candle not found. Skipping stock."
+                    )
+                    continue
+
+                opt_first_candle = target_915_candle.iloc[0]
+
+                option_five_min_high = float(opt_first_candle["high"])
+                option_five_min_low = float(opt_first_candle["low"])
+                option_five_min_close = float(opt_first_candle["close"])
+                option_five_min_volume = float(opt_first_candle["volume"])
+
+                logger.info(
+                    f"[PHASE1] Option {option_symbol} first 5-min candle | "
+                    f"High={option_five_min_high:.2f} | "
+                    f"Low={option_five_min_low:.2f} | "
+                    f"Close={option_five_min_close:.2f} | "
+                    f"Volume={option_five_min_volume:.0f} | "
+                    f"Timestamp={opt_first_candle['Timestamp']}"
+                )
+
+                # ==========================================================
+                # STEP 4: Build watchlist entry
+                # five_min_high = option's 5-min candle HIGH (trigger threshold)
+                # five_min_low, five_min_close, five_min_volume = option's 5-min candle values
+                # stoploss = option's 5-min candle LOW
+                # avg_volume_20 retained from stock (20-day stock avg volume)
+                # ==========================================================
 
                 entry = {
-                    "timestamp":       self._now_ist(),
-                    "option_symbol":   option_symbol,
-                    "stock_symbol":    symbol,
-                    "option_type":     option_type,
-                    
+                    "timestamp":         self._now_ist(),
+                    "option_symbol":     option_symbol,
+                    "stock_symbol":      symbol,
+                    "option_type":       option_type,
                     "previous_day_high": prev_day_high,
                     "previous_day_date": str(last_day),
-
-                    "five_min_high":   first_candle["high"],
-                    "five_min_low":    first_candle["low"],
-                    "five_min_close":  first_candle["close"],
-                    "five_min_volume": first_candle["volume"],
-                    "avg_volume_20":   avg_vol,
-                    "entry_signal":    False,
-                    "status":          "ACTIVE",
-                    "stoploss":        first_candle["low"],
+                    "five_min_high":     option_five_min_high,    # option's 5-min candle HIGH — trigger threshold
+                    "five_min_low":      option_five_min_low,     # option's 5-min candle LOW
+                    "five_min_close":    option_five_min_close,   # option's 5-min candle CLOSE
+                    "five_min_volume":   option_five_min_volume,  # option's 5-min candle VOLUME
+                    "avg_volume_20":     avg_vol,
+                    "entry_signal":      False,
+                    "status":            "ACTIVE",
+                    "stoploss":          option_five_min_low,     # stoploss = option's 5-min candle LOW
                 }
 
                 self.watchlist.append(entry)
                 added += 1
-                logger.info(f"[PHASE1] Added {option_symbol} to Phase 1 watchlist")
+                logger.info(
+                    f"[PHASE1] Added to watchlist: "
+                    f"option_symbol={option_symbol} | "
+                    f"stock_symbol={symbol} | "
+                    f"five_min_high={option_five_min_high:.2f} (option 5-min high — 1-min trigger threshold) | "
+                    f"stoploss={option_five_min_low:.2f} (option 5-min low)"
+                )
 
-                if len(self.watchlist) >= 10:
-                    self.save_watchlist_to_csv()
+                self.save_watchlist_to_csv()
 
             except Exception:
-                logger.exception(f"[PHASE1] Error processing {option_symbol}")
+                logger.exception(f"[PHASE1] Error processing stock {symbol}")
                 continue
 
-        self.save_watchlist_to_csv()
         logger.info(f"[PHASE1] Processed {processed} stocks, added {added} to watchlist")
 
     # ===============================
