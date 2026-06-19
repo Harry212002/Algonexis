@@ -22,9 +22,16 @@ IST = pytz.timezone("Asia/Kolkata")
 # FIXED SCHEMAS
 # ===============================
 SECTOR_COLS = ["scan_time", "sector", "sector_change", "url", "status"]
-STOCK_COLS  = [
-    "scan_time", "Sector", "Sector Change %",
-    "Symbol", "Price", "Stock Change %", "OI Change", "Volume", "status",
+STOCK_COLS = [
+    "scan_time",
+    "Sector",
+    "Sector Change %",
+    "Symbol",
+    "Price",
+    "Stock Change %",
+    "OI Change",
+    "Volume",
+    "status",
 ]
 
 
@@ -36,24 +43,24 @@ class SectorMomentumBreakoutStrategy:
     # DEFAULT PHASE TIMES  — single source of truth
     # ------------------------------------------------------------------
     PHASE1_START_TIME = "09:20"
-    PHASE1_END_TIME   = "09:30"
+    PHASE1_END_TIME = "09:30"
     PHASE2_START_TIME = "09:30"
-    PHASE2_END_TIME   = "15:30"
+    PHASE2_END_TIME = "15:30"
 
     PHASE2_SCAN_INTERVAL_MINUTES = 15
 
     def __init__(self, angel, settings, data, user_profile, stop_event=None, **kwargs):
         logger.info("[INIT] SectorMomentumBreakoutStrategy initializing")
-        self.angel        = angel
-        self.settings     = settings
+        self.angel = angel
+        self.settings = settings
         self.user_profile = user_profile
 
-        self.watchlist      = []
-        self.watchlist_csv  = "watchlist.csv"
-        self.watchlist2     = []
+        self.watchlist = []
+        self.watchlist_csv = "watchlist.csv"
+        self.watchlist2 = []
         self.watchlist_csv2 = "watchlist2.csv"
 
-        self.trades_today       = 0
+        self.trades_today = 0
         self.max_trades_per_day = int(settings.get("trades_per_day", 5))
         logger.info(f"[INIT] Max trades per day: {self.max_trades_per_day}")
 
@@ -63,7 +70,7 @@ class SectorMomentumBreakoutStrategy:
         self.stop_event = stop_event or threading.Event()
 
         self.websocket_manager = kwargs.get("websocket_manager", None)
-        self.order_manager     = kwargs.get("order_manager", None)
+        self.order_manager = kwargs.get("order_manager", None)
 
         # ---- Resolve effective phase times ----
         self._phase1_start = self._parse_time(
@@ -88,6 +95,16 @@ class SectorMomentumBreakoutStrategy:
         # WS started flags (per-day guards)
         self._ws_phase1_started = False
         self._ws_phase2_started = False
+
+        # ------------------------------------------------------------------
+        # NEW: Tracks which option symbols already have a per-stock signal
+        # checker thread running (Phase 1 only). Prevents the legacy batch
+        # starter in _run_phase1 from spawning a duplicate checker for a
+        # symbol whose immediate per-stock checker (started the moment it
+        # was added to the watchlist) is already running.
+        # ------------------------------------------------------------------
+        self._phase1_checker_started_symbols = set()
+        self._phase1_checker_lock = threading.Lock()
 
         t = threading.Thread(
             target=self.scheduler_loop,
@@ -119,20 +136,20 @@ class SectorMomentumBreakoutStrategy:
         Falls back to django settings if angel object doesn't have them.
         """
         creds = {
-            "jwt_token":   None,
-            "feed_token":  None,
+            "jwt_token": None,
+            "feed_token": None,
             "client_code": None,
-            "api_key":     None,
+            "api_key": None,
         }
         # Try angel object attributes first (most reliable)
         try:
-            if hasattr(self.angel, 'access_token') and self.angel.access_token:
+            if hasattr(self.angel, "access_token") and self.angel.access_token:
                 creds["jwt_token"] = self.angel.access_token
-            if hasattr(self.angel, 'feed_token') and self.angel.feed_token:
+            if hasattr(self.angel, "feed_token") and self.angel.feed_token:
                 creds["feed_token"] = self.angel.feed_token
-            if hasattr(self.angel, 'clientCode') and self.angel.clientCode:
+            if hasattr(self.angel, "clientCode") and self.angel.clientCode:
                 creds["client_code"] = self.angel.clientCode
-            if hasattr(self.angel, 'api_key') and self.angel.api_key:
+            if hasattr(self.angel, "api_key") and self.angel.api_key:
                 creds["api_key"] = self.angel.api_key
         except Exception:
             logger.exception("[CREDS] Error extracting credentials from angel object")
@@ -142,11 +159,12 @@ class SectorMomentumBreakoutStrategy:
         if missing:
             try:
                 from django.conf import settings as django_settings
+
                 mapping = {
-                    "jwt_token":   "ANGEL_JWT_TOKEN",
-                    "feed_token":  "ANGEL_FEED_TOKEN",
+                    "jwt_token": "ANGEL_JWT_TOKEN",
+                    "feed_token": "ANGEL_FEED_TOKEN",
                     "client_code": "ANGEL_CLIENT_CODE",
-                    "api_key":     "ANGEL_API_KEY",
+                    "api_key": "ANGEL_API_KEY",
                 }
                 for key in missing:
                     val = getattr(django_settings, mapping[key], None)
@@ -156,10 +174,12 @@ class SectorMomentumBreakoutStrategy:
             except Exception:
                 logger.exception("[CREDS] Error reading django settings for WS creds")
 
-        logger.info(f"[CREDS] jwt_token={'set' if creds['jwt_token'] else 'MISSING'} | "
-                    f"feed_token={'set' if creds['feed_token'] else 'MISSING'} | "
-                    f"client_code={creds['client_code']} | "
-                    f"api_key={'set' if creds['api_key'] else 'MISSING'}")
+        logger.info(
+            f"[CREDS] jwt_token={'set' if creds['jwt_token'] else 'MISSING'} | "
+            f"feed_token={'set' if creds['feed_token'] else 'MISSING'} | "
+            f"client_code={creds['client_code']} | "
+            f"api_key={'set' if creds['api_key'] else 'MISSING'}"
+        )
         return creds
 
     # ===============================
@@ -169,11 +189,20 @@ class SectorMomentumBreakoutStrategy:
     def _initialize_csv_headers(self):
         if not os.path.exists(self.watchlist_csv):
             headers = [
-                "timestamp", "option_symbol", "stock_symbol", "option_type",
-                "previous_day_high","previous_day_date",
-                "five_min_high", "five_min_low", "five_min_close",
-                "five_min_volume", "avg_volume_20", "entry_signal",
-                "status", "stoploss",
+                "timestamp",
+                "option_symbol",
+                "stock_symbol",
+                "option_type",
+                "previous_day_high",
+                "previous_day_date",
+                "five_min_high",
+                "five_min_low",
+                "five_min_close",
+                "five_min_volume",
+                "avg_volume_20",
+                "entry_signal",
+                "status",
+                "stoploss",
             ]
             try:
                 with open(self.watchlist_csv, "w", newline="") as f:
@@ -185,10 +214,21 @@ class SectorMomentumBreakoutStrategy:
     def _initialize_csv_headers_for_watchlist2(self):
         if not os.path.exists(self.watchlist_csv2):
             headers = [
-                "timestamp", "option_symbol", "stock_symbol", "option_type",
-                "five_min_high", "five_min_low", "five_min_close",
-                "five_min_volume", "avg_volume_20", "vwap", "wma_9",
-                "entry_signal", "status", "limit_price", "stoploss",
+                "timestamp",
+                "option_symbol",
+                "stock_symbol",
+                "option_type",
+                "five_min_high",
+                "five_min_low",
+                "five_min_close",
+                "five_min_volume",
+                "avg_volume_20",
+                "vwap",
+                "wma_9",
+                "entry_signal",
+                "status",
+                "limit_price",
+                "stoploss",
             ]
             try:
                 with open(self.watchlist_csv2, "w", newline="") as f:
@@ -212,7 +252,9 @@ class SectorMomentumBreakoutStrategy:
                     df["scan_time"] = pd.to_datetime(df["scan_time"], errors="coerce")
                     df = df[df["scan_time"].dt.date == today]
                 df.to_csv(csv_path, index=False)
-                logger.info(f"[CLEAN] {csv_path} cleaned, {len(df)} rows kept from today")
+                logger.info(
+                    f"[CLEAN] {csv_path} cleaned, {len(df)} rows kept from today"
+                )
             except Exception:
                 logger.exception(f"[CLEAN] Error cleaning {csv_path}")
 
@@ -227,7 +269,10 @@ class SectorMomentumBreakoutStrategy:
     def find_last_expiry_of_month(self, expiry_dates, month_date):
         last_expiry = None
         for expiry_date in expiry_dates:
-            if expiry_date.month == month_date.month and expiry_date.year == month_date.year:
+            if (
+                expiry_date.month == month_date.month
+                and expiry_date.year == month_date.year
+            ):
                 if last_expiry is None or expiry_date > last_expiry:
                     last_expiry = expiry_date
         return last_expiry
@@ -236,12 +281,14 @@ class SectorMomentumBreakoutStrategy:
         try:
             df = symboldf.copy()
             df = df[
-                (df.name == index) &
-                (df.instrumenttype == "OPTSTK") &
-                (df.exch_seg == exchange)
+                (df.name == index)
+                & (df.instrumenttype == "OPTSTK")
+                & (df.exch_seg == exchange)
             ].copy()
 
-            df["expiry"] = pd.to_datetime(df["expiry"], format="%d%b%Y", errors="coerce")
+            df["expiry"] = pd.to_datetime(
+                df["expiry"], format="%d%b%Y", errors="coerce"
+            )
             today = pd.to_datetime(timezone.localtime(timezone.now()).date())
             df = df[df.expiry >= today].reset_index(drop=True)
 
@@ -249,19 +296,21 @@ class SectorMomentumBreakoutStrategy:
                 pd.Series(df["expiry"].dropna().unique().tolist()).sort_values()
             ).reset_index(drop=True)
 
-            current_date           = timezone.localtime(timezone.now()).date()
+            current_date = timezone.localtime(timezone.now()).date()
             last_day_current_month = self.get_last_day_of_month_fut(current_date)
-            last_expiry_this_month = self.find_last_expiry_of_month(expiry_dates, last_day_current_month)
+            last_expiry_this_month = self.find_last_expiry_of_month(
+                expiry_dates, last_day_current_month
+            )
 
             if last_expiry_this_month is None:
                 next_month = current_date.replace(day=28) + timedelta(days=4)
-                nm_expiry  = self.find_last_expiry_of_month(expiry_dates, next_month)
+                nm_expiry = self.find_last_expiry_of_month(expiry_dates, next_month)
                 if nm_expiry:
                     return nm_expiry
 
             if setting.get("expiry_date") == "next_month":
                 next_month = current_date.replace(day=28) + timedelta(days=4)
-                nm_expiry  = self.find_last_expiry_of_month(expiry_dates, next_month)
+                nm_expiry = self.find_last_expiry_of_month(expiry_dates, next_month)
                 if nm_expiry:
                     return nm_expiry
 
@@ -283,8 +332,10 @@ class SectorMomentumBreakoutStrategy:
         expiry_date = self.getExpiryDateFut(index, setting, exchange, symboldf)
         if expiry_date is None:
             logger.error(f"[EXPIRY] Could not find expiry date for {index}")
-            fallback_date = self.get_last_day_of_month_fut(datetime.now().date()) + timedelta(days=7)
-            fallback_str  = fallback_date.strftime("%d%b%y").upper()
+            fallback_date = self.get_last_day_of_month_fut(
+                datetime.now().date()
+            ) + timedelta(days=7)
+            fallback_str = fallback_date.strftime("%d%b%y").upper()
             logger.warning(f"[EXPIRY] Using fallback expiry: {fallback_str}")
             return fallback_str
         return expiry_date.strftime("%d%b%y").upper()
@@ -303,7 +354,7 @@ class SectorMomentumBreakoutStrategy:
     def get_correct_strike_price(self, ltp, ce_pe, strike_prices, strike_multiplier):
         try:
             higher_strikes = [s for s in strike_prices if s >= ltp]
-            lower_strikes  = [s for s in strike_prices if s < ltp]
+            lower_strikes = [s for s in strike_prices if s < ltp]
 
             if ce_pe == "CE":
                 strike_price = (
@@ -319,10 +370,14 @@ class SectorMomentumBreakoutStrategy:
                 )
             return strike_price
         except Exception:
-            logger.exception(f"[STRIKE] Error computing strike price ltp={ltp} ce_pe={ce_pe}")
+            logger.exception(
+                f"[STRIKE] Error computing strike price ltp={ltp} ce_pe={ce_pe}"
+            )
             return None
 
-    def angel_fetch_symbol(self, obj, symbol, index, ce_pe, setting, instrument_list, symboldf):
+    def angel_fetch_symbol(
+        self, obj, symbol, index, ce_pe, setting, instrument_list, symboldf
+    ):
         """
         Fetch option symbol.
         If the generated symbol token is None, tries ATM strike and ±1 strikes
@@ -340,23 +395,30 @@ class SectorMomentumBreakoutStrategy:
             ltp = None
             for attempt in range(3):
                 try:
-                    ltp_resp = self.order_manager.get_ltp(obj, instrument_list, symbol, "NSE")
+                    ltp_resp = self.order_manager.get_ltp(
+                        obj, instrument_list, symbol, "NSE"
+                    )
                     if ltp_resp and ltp_resp.get("status") and "data" in ltp_resp:
                         ltp = ltp_resp["data"]["ltp"]
-                        logger.info(f"[STRIKE] LTP fetched on attempt {attempt + 1}: {ltp}")
+                        logger.info(
+                            f"[STRIKE] LTP fetched on attempt {attempt + 1}: {ltp}"
+                        )
                         break
                 except Exception:
-                    logger.exception(f"[STRIKE] LTP fetch error on attempt {attempt + 1} for {symbol}")
+                    logger.exception(
+                        f"[STRIKE] LTP fetch error on attempt {attempt + 1} for {symbol}"
+                    )
                 time.sleep(1)
 
             if ltp is None:
-                logger.error(f"[STRIKE] Could not fetch LTP for {symbol} after 3 attempts")
+                logger.error(
+                    f"[STRIKE] Could not fetch LTP for {symbol} after 3 attempts"
+                )
                 return None
 
             # Get strike prices from symboldf
             filtered = symboldf[
-                (symboldf["name"] == index) &
-                (symboldf["instrumenttype"] == "OPTSTK")
+                (symboldf["name"] == index) & (symboldf["instrumenttype"] == "OPTSTK")
             ]
             if filtered.empty:
                 logger.error(f"[STRIKE] No option data found for {index}")
@@ -369,14 +431,22 @@ class SectorMomentumBreakoutStrategy:
             ]
 
             strike_multiplier = int(setting.get("strike_price", 1))
-            correct_strike = self.get_correct_strike_price(ltp, ce_pe, strike_prices, strike_multiplier)
+            correct_strike = self.get_correct_strike_price(
+                ltp, ce_pe, strike_prices, strike_multiplier
+            )
             if correct_strike is None:
-                logger.error(f"[STRIKE] Could not determine correct strike for {symbol}")
+                logger.error(
+                    f"[STRIKE] Could not determine correct strike for {symbol}"
+                )
                 return None
 
             # Try primary strike first, then fallback to adjacent strikes if token not found
             candidates = [correct_strike]
-            idx = strike_prices.index(correct_strike) if correct_strike in strike_prices else -1
+            idx = (
+                strike_prices.index(correct_strike)
+                if correct_strike in strike_prices
+                else -1
+            )
             if idx >= 0:
                 if idx + 1 < len(strike_prices):
                     candidates.append(strike_prices[idx + 1])
@@ -386,14 +456,22 @@ class SectorMomentumBreakoutStrategy:
             for strike in candidates:
                 option_symbol = f"{index}{expiry}{strike}{ce_pe}"
                 # Quick token validation
-                test_token = self.order_manager.token_lookup(option_symbol, instrument_list, exchange="NFO")
+                test_token = self.order_manager.token_lookup(
+                    option_symbol, instrument_list, exchange="NFO"
+                )
                 if test_token:
-                    logger.info(f"[STRIKE] Generated option symbol: {option_symbol} (token={test_token})")
+                    logger.info(
+                        f"[STRIKE] Generated option symbol: {option_symbol} (token={test_token})"
+                    )
                     return option_symbol
                 else:
-                    logger.warning(f"[STRIKE] No token for {option_symbol}, trying next strike")
+                    logger.warning(
+                        f"[STRIKE] No token for {option_symbol}, trying next strike"
+                    )
 
-            logger.error(f"[STRIKE] No valid option symbol found for {symbol} near strike {correct_strike}")
+            logger.error(
+                f"[STRIKE] No valid option symbol found for {symbol} near strike {correct_strike}"
+            )
             return None
 
         except Exception:
@@ -406,8 +484,9 @@ class SectorMomentumBreakoutStrategy:
     #      preventing the "No today candles" issue caused by UTC offset.
     # ===============================
 
-    def get_todays_ohlc_data_(self, obj, opt_symbol, interval, instrument_list,
-                               exchange="NFO", retries=3):
+    def get_todays_ohlc_data_(
+        self, obj, opt_symbol, interval, instrument_list, exchange="NFO", retries=3
+    ):
         """
         Fetch OHLC candle data for opt_symbol.
         Uses exponential backoff with jitter to handle rate-limit errors.
@@ -421,23 +500,20 @@ class SectorMomentumBreakoutStrategy:
             interval = "FIVE_MINUTE"
 
         # Use pytz IST datetime to guarantee correct local time strings
-        now_ist   = self._now_ist()
+        now_ist = self._now_ist()
         today_str = now_ist.strftime("%Y-%m-%d %H:%M")
 
-        thirty_five_days_ago = (
-            now_ist - timedelta(days=35)
-        ).replace(
-            hour=9,
-            minute=15,
-            second=0,
-            microsecond=0
+        thirty_five_days_ago = (now_ist - timedelta(days=35)).replace(
+            hour=9, minute=15, second=0, microsecond=0
         )
 
         fromdate = thirty_five_days_ago.strftime("%Y-%m-%d %H:%M")
 
         token = None
         try:
-            token = self.order_manager.token_lookup(opt_symbol, instrument_list, exchange=exchange)
+            token = self.order_manager.token_lookup(
+                opt_symbol, instrument_list, exchange=exchange
+            )
             logger.info(f"[TOKEN CHECK] {opt_symbol} -> token={token}")
         except Exception:
             logger.exception(f"[OHLC] Token lookup failed for {opt_symbol}")
@@ -448,11 +524,11 @@ class SectorMomentumBreakoutStrategy:
             return None
 
         params = {
-            "exchange":    exchange,
+            "exchange": exchange,
             "symboltoken": token,
-            "interval":    interval,
+            "interval": interval,
             "fromdate": fromdate,
-            "todate":      today_str,
+            "todate": today_str,
         }
 
         logger.info(
@@ -482,7 +558,9 @@ class SectorMomentumBreakoutStrategy:
                 hist = obj.getCandleData(params)
 
                 if hist is None:
-                    logger.warning(f"[OHLC] None response on attempt {attempt + 1} for {opt_symbol}")
+                    logger.warning(
+                        f"[OHLC] None response on attempt {attempt + 1} for {opt_symbol}"
+                    )
                     continue
 
                 if isinstance(hist, dict) and hist.get("data"):
@@ -491,10 +569,18 @@ class SectorMomentumBreakoutStrategy:
                         columns=["Timestamp", "open", "high", "low", "close", "volume"],
                     )
                     if not df.empty:
-                        logger.info(f"[OHLC] {len(df)} candles fetched for {opt_symbol}")
-                        logger.info(f"[OHLC RAW FIRST] {opt_symbol} {df.iloc[0].to_dict()}")
-                        logger.info(f"[OHLC RAW LAST] {opt_symbol} {df.iloc[-1].to_dict()}")
-                        logger.info(f"[OHLC RAW LAST5] {opt_symbol} {df.tail(5).to_dict('records')}")
+                        logger.info(
+                            f"[OHLC] {len(df)} candles fetched for {opt_symbol}"
+                        )
+                        logger.info(
+                            f"[OHLC RAW FIRST] {opt_symbol} {df.iloc[0].to_dict()}"
+                        )
+                        logger.info(
+                            f"[OHLC RAW LAST] {opt_symbol} {df.iloc[-1].to_dict()}"
+                        )
+                        logger.info(
+                            f"[OHLC RAW LAST5] {opt_symbol} {df.tail(5).to_dict('records')}"
+                        )
                         return df.reset_index(drop=True)
                     logger.warning(
                         f"[OHLC] Empty DataFrame on attempt {attempt + 1} for {opt_symbol}"
@@ -531,7 +617,7 @@ class SectorMomentumBreakoutStrategy:
             csv_path = "sectorwise_stocks_filtered.csv"
             if not os.path.exists(csv_path):
                 return
-            df   = pd.read_csv(csv_path)
+            df = pd.read_csv(csv_path)
             mask = (df["Symbol"] == symbol) & (df["status"] == "ACTIVE")
             if mask.any():
                 df.loc[mask, "status"] = "INACTIVE"
@@ -572,12 +658,22 @@ class SectorMomentumBreakoutStrategy:
     def save_watchlist_to_csv(self):
         if not self.watchlist:
             return
-        today   = datetime.now().date()
+        today = datetime.now().date()
         headers = [
-            "timestamp", "option_symbol", "stock_symbol", "option_type",
-            "previous_day_high","previous_day_date",
-            "five_min_high", "five_min_low", "five_min_close",
-            "five_min_volume", "avg_volume_20", "entry_signal", "status", "stoploss",
+            "timestamp",
+            "option_symbol",
+            "stock_symbol",
+            "option_type",
+            "previous_day_high",
+            "previous_day_date",
+            "five_min_high",
+            "five_min_low",
+            "five_min_close",
+            "five_min_volume",
+            "avg_volume_20",
+            "entry_signal",
+            "status",
+            "stoploss",
         ]
         try:
             todays = [e for e in self.watchlist if e["timestamp"].date() == today]
@@ -596,9 +692,13 @@ class SectorMomentumBreakoutStrategy:
 
             new_df = pd.DataFrame(todays)
             new_df["timestamp"] = new_df["timestamp"].apply(
-                lambda ts: ts.strftime("%Y-%m-%d %H:%M:%S") if hasattr(ts, "strftime") else ts
+                lambda ts: (
+                    ts.strftime("%Y-%m-%d %H:%M:%S") if hasattr(ts, "strftime") else ts
+                )
             )
-            pd.concat([df, new_df], ignore_index=True).to_csv(self.watchlist_csv, index=False)
+            pd.concat([df, new_df], ignore_index=True).to_csv(
+                self.watchlist_csv, index=False
+            )
             logger.info(f"[SAVE] {len(new_df)} entries saved to {self.watchlist_csv}")
         except Exception:
             logger.exception("[SAVE] Failed to save watchlist CSV")
@@ -608,12 +708,23 @@ class SectorMomentumBreakoutStrategy:
     def save_watchlist2_to_csv(self):
         if not self.watchlist2:
             return
-        today   = datetime.now().date()
+        today = datetime.now().date()
         headers = [
-            "timestamp", "option_symbol", "stock_symbol", "option_type",
-            "five_min_high", "five_min_low", "five_min_close",
-            "five_min_volume", "avg_volume_20", "vwap", "wma_9",
-            "entry_signal", "status", "limit_price", "stoploss",
+            "timestamp",
+            "option_symbol",
+            "stock_symbol",
+            "option_type",
+            "five_min_high",
+            "five_min_low",
+            "five_min_close",
+            "five_min_volume",
+            "avg_volume_20",
+            "vwap",
+            "wma_9",
+            "entry_signal",
+            "status",
+            "limit_price",
+            "stoploss",
         ]
         try:
             todays = [e for e in self.watchlist2 if e["timestamp"].date() == today]
@@ -632,9 +743,13 @@ class SectorMomentumBreakoutStrategy:
 
             new_df = pd.DataFrame(todays)
             new_df["timestamp"] = new_df["timestamp"].apply(
-                lambda ts: ts.strftime("%Y-%m-%d %H:%M:%S") if hasattr(ts, "strftime") else ts
+                lambda ts: (
+                    ts.strftime("%Y-%m-%d %H:%M:%S") if hasattr(ts, "strftime") else ts
+                )
             )
-            pd.concat([df, new_df], ignore_index=True).to_csv(self.watchlist_csv2, index=False)
+            pd.concat([df, new_df], ignore_index=True).to_csv(
+                self.watchlist_csv2, index=False
+            )
             logger.info(f"[SAVE] {len(new_df)} entries saved to {self.watchlist_csv2}")
         except Exception:
             logger.exception("[SAVE] Failed to save watchlist2 CSV")
@@ -653,6 +768,9 @@ class SectorMomentumBreakoutStrategy:
         except Exception:
             logger.exception("[RESET W1] Error deactivating watchlist1")
         self.watchlist.clear()
+        # NEW: clear the per-stock checker-started tracker for the new Phase 1 run
+        with self._phase1_checker_lock:
+            self._phase1_checker_started_symbols.clear()
 
     def deactivate_watchlist2(self):
         logger.info("[RESET W2] Deactivating all Phase 2 watchlist entries")
@@ -680,58 +798,242 @@ class SectorMomentumBreakoutStrategy:
     def run_scrap_sector(self, settings):
         try:
             SECTOR_SCAN_LIMIT = int(settings.get("sectors_scan", 3))
-            STOCK_SCAN_LIMIT  = int(settings.get("stocks_scan", 3))
+            STOCK_SCAN_LIMIT = int(settings.get("stocks_scan", 3))
 
-            logger.info(f"[SECTOR_SCAN] Sector limit: {SECTOR_SCAN_LIMIT}, Stock limit: {STOCK_SCAN_LIMIT}")
+            logger.info(
+                f"[SECTOR_SCAN] Sector limit: {SECTOR_SCAN_LIMIT}, Stock limit: {STOCK_SCAN_LIMIT}"
+            )
 
             scan_time = self._now_ist().strftime("%Y-%m-%d %H:%M:%S")
             logger.info(f"[SECTOR_SCAN] Started at {scan_time}")
 
             fno_symbols = {
-                "GMRAIRPORT", "KFINTECH", "TORNTPHARM", "POWERGRID", "ADANIGREEN", "COALINDIA",
-                "IREDA", "DIXON", "AUROPHARMA", "HDFCBANK", "ABCAPITAL", "KALYANKJIL", "PFC",
-                "LTF", "KPITTECH", "JSWENERGY", "ASTRAL", "JINDALSTEL", "CUMMINSIND", "NHPC",
-                "DLF", "CANBK", "ADANIENT", "SBICARD", "VBL", "OFSS", "BAJAJHLDNG", "BANKINDIA",
-                "MAXHEALTH", "GLENMARK", "AXISBANK", "INDUSTOWER", "SIEMENS", "IDEA", "ABB",
-                "NYKAA", "NTPC", "NBCC", "LODHA", "GAIL", "ALKEM", "KAYNES", "BHEL", "ONGC",
-                "POWERINDIA", "TATAPOWER", "ADANIPORTS", "CAMS", "CIPLA", "SWIGGY", "MARICO",
-                "HAVELLS", "CGPOWER", "BRITANNIA", "SHRIRAMFIN", "BANKBARODA", "GODREJCP", "OIL",
-                "BANDHANBNK", "IDFCFIRSTB", "MANKIND", "CDSL", "ASIANPAINT", "BAJAJFINSV", "MFSL",
-                "ADANIENSOL", "ITC", "LUPIN", "PNBHOUSING", "POLYCAB", "OBEROIRLTY", "SUPREMEIND",
-                "GODREJPROP", "UPL", "PHOENIXLTD", "RECLTD", "PGEL", "PIDILITIND", "SUZLON",
-                "AUBANK", "HDFCAMC", "TATASTEEL", "AMBUJACEM", "HDFCLIFE", "ETERNAL", "JSWSTEEL",
-                "NESTLEIND", "EXIDEIND", "SBILIFE", "BHARTIARTL", "GRASIM", "SHREECEM", "CONCOR",
-                "PREMIERENE", "BIOCON", "INDIGO", "MOTHERSON", "PERSISTENT", "RVNL", "SYNGENE",
-                "INDIANB", "TATACONSUM", "DIVISLAB", "PNB", "DABUR", "CROMPTON", "HINDUNILVR",
-                "BDL", "WAAREEENER", "ZYDUSLIFE", "VEDL", "SAMMAANCAP", "TIINDIA", "PETRONET",
-                "PRESTIGE", "APOLLOHOSP", "INDUSINDBK", "SRF", "RELIANCE", "AMBER", "KOTAKBANK",
-                "IRFC", "COFORGE", "SOLARINDS", "DRREDDY", "YESBANK", "NMDC", "BEL", "LAURUSLABS",
-                "LT", "HAL", "JUBLFOOD", "LTIM", "SUNPHARMA", "IEX", "LICHSGFIN", "TORNTPOWER",
-                "VOLTAS", "UNIONBANK", "TCS", "360ONE", "BHARATFORG", "FEDERALBNK", "ICICIBANK",
-                "HCLTECH", "UNITDSPR", "PATANJALI", "ICICIGI", "TRENT", "HINDZINC", "PPLPHARMA",
-                "PAGEIND", "MAZDOCK", "SBIN", "DELHIVERY", "LICI", "COLPAL", "TITAN", "MANAPPURAM",
-                "ASHOKLEY", "APLAPOLLO", "TATATECH", "DALBHARAT", "BAJAJ-AUTO", "NUVAMA",
-                "EICHERMOT", "ULTRACEMCO", "FORTIS", "RBLBANK", "HINDALCO", "HUDCO", "PAYTM",
-                "MPHASIS", "HINDPETRO", "ICICIPRULI", "BPCL", "TATAELXSI", "SAIL", "BOSCHLTD",
-                "TVSMOTOR", "TMPV", "CHOLAFIN", "IRCTC", "BAJFINANCE", "SONACOMS", "M&M",
-                "NATIONALUM", "JIOFIN", "DMART", "MCX", "WIPRO", "MARUTI", "POLICYBZR", "NAUKRI",
-                "INDHOTEL", "BLUESTARCO", "IOC", "INFY", "KEI", "TECHM", "UNOMINDA", "HEROMOTOCO",
-                "INOXWIND", "MUTHOOTFIN", "PIIND", "ANGELONE", "BSE",
+                "GMRAIRPORT",
+                "KFINTECH",
+                "TORNTPHARM",
+                "POWERGRID",
+                "ADANIGREEN",
+                "COALINDIA",
+                "IREDA",
+                "DIXON",
+                "AUROPHARMA",
+                "HDFCBANK",
+                "ABCAPITAL",
+                "KALYANKJIL",
+                "PFC",
+                "LTF",
+                "KPITTECH",
+                "JSWENERGY",
+                "ASTRAL",
+                "JINDALSTEL",
+                "CUMMINSIND",
+                "NHPC",
+                "DLF",
+                "CANBK",
+                "ADANIENT",
+                "SBICARD",
+                "VBL",
+                "OFSS",
+                "BAJAJHLDNG",
+                "BANKINDIA",
+                "MAXHEALTH",
+                "GLENMARK",
+                "AXISBANK",
+                "INDUSTOWER",
+                "SIEMENS",
+                "IDEA",
+                "ABB",
+                "NYKAA",
+                "NTPC",
+                "NBCC",
+                "LODHA",
+                "GAIL",
+                "ALKEM",
+                "KAYNES",
+                "BHEL",
+                "ONGC",
+                "POWERINDIA",
+                "TATAPOWER",
+                "ADANIPORTS",
+                "CAMS",
+                "CIPLA",
+                "SWIGGY",
+                "MARICO",
+                "HAVELLS",
+                "CGPOWER",
+                "BRITANNIA",
+                "SHRIRAMFIN",
+                "BANKBARODA",
+                "GODREJCP",
+                "OIL",
+                "BANDHANBNK",
+                "IDFCFIRSTB",
+                "MANKIND",
+                "CDSL",
+                "ASIANPAINT",
+                "BAJAJFINSV",
+                "MFSL",
+                "ADANIENSOL",
+                "ITC",
+                "LUPIN",
+                "PNBHOUSING",
+                "POLYCAB",
+                "OBEROIRLTY",
+                "SUPREMEIND",
+                "GODREJPROP",
+                "UPL",
+                "PHOENIXLTD",
+                "RECLTD",
+                "PGEL",
+                "PIDILITIND",
+                "SUZLON",
+                "AUBANK",
+                "HDFCAMC",
+                "TATASTEEL",
+                "AMBUJACEM",
+                "HDFCLIFE",
+                "ETERNAL",
+                "JSWSTEEL",
+                "NESTLEIND",
+                "EXIDEIND",
+                "SBILIFE",
+                "BHARTIARTL",
+                "GRASIM",
+                "SHREECEM",
+                "CONCOR",
+                "PREMIERENE",
+                "BIOCON",
+                "INDIGO",
+                "MOTHERSON",
+                "PERSISTENT",
+                "RVNL",
+                "SYNGENE",
+                "INDIANB",
+                "TATACONSUM",
+                "DIVISLAB",
+                "PNB",
+                "DABUR",
+                "CROMPTON",
+                "HINDUNILVR",
+                "BDL",
+                "WAAREEENER",
+                "ZYDUSLIFE",
+                "VEDL",
+                "SAMMAANCAP",
+                "TIINDIA",
+                "PETRONET",
+                "PRESTIGE",
+                "APOLLOHOSP",
+                "INDUSINDBK",
+                "SRF",
+                "RELIANCE",
+                "AMBER",
+                "KOTAKBANK",
+                "IRFC",
+                "COFORGE",
+                "SOLARINDS",
+                "DRREDDY",
+                "YESBANK",
+                "NMDC",
+                "BEL",
+                "LAURUSLABS",
+                "LT",
+                "HAL",
+                "JUBLFOOD",
+                "LTIM",
+                "SUNPHARMA",
+                "IEX",
+                "LICHSGFIN",
+                "TORNTPOWER",
+                "VOLTAS",
+                "UNIONBANK",
+                "TCS",
+                "360ONE",
+                "BHARATFORG",
+                "FEDERALBNK",
+                "ICICIBANK",
+                "HCLTECH",
+                "UNITDSPR",
+                "PATANJALI",
+                "ICICIGI",
+                "TRENT",
+                "HINDZINC",
+                "PPLPHARMA",
+                "PAGEIND",
+                "MAZDOCK",
+                "SBIN",
+                "DELHIVERY",
+                "LICI",
+                "COLPAL",
+                "TITAN",
+                "MANAPPURAM",
+                "ASHOKLEY",
+                "APLAPOLLO",
+                "TATATECH",
+                "DALBHARAT",
+                "BAJAJ-AUTO",
+                "NUVAMA",
+                "EICHERMOT",
+                "ULTRACEMCO",
+                "FORTIS",
+                "RBLBANK",
+                "HINDALCO",
+                "HUDCO",
+                "PAYTM",
+                "MPHASIS",
+                "HINDPETRO",
+                "ICICIPRULI",
+                "BPCL",
+                "TATAELXSI",
+                "SAIL",
+                "BOSCHLTD",
+                "TVSMOTOR",
+                "TMPV",
+                "CHOLAFIN",
+                "IRCTC",
+                "BAJFINANCE",
+                "SONACOMS",
+                "M&M",
+                "NATIONALUM",
+                "JIOFIN",
+                "DMART",
+                "MCX",
+                "WIPRO",
+                "MARUTI",
+                "POLICYBZR",
+                "NAUKRI",
+                "INDHOTEL",
+                "BLUESTARCO",
+                "IOC",
+                "INFY",
+                "KEI",
+                "TECHM",
+                "UNOMINDA",
+                "HEROMOTOCO",
+                "INOXWIND",
+                "MUTHOOTFIN",
+                "PIIND",
+                "ANGELONE",
+                "BSE",
             }
 
             session = requests.Session()
-            session.headers.update({
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                              "AppleWebKit/537.36 (KHTML, like Gecko) "
-                              "Chrome/120.0.0.0 Safari/537.36",
-                "Accept":     "application/json",
-                "Referer":    "https://www.nseindia.com/",
-            })
+            session.headers.update(
+                {
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/120.0.0.0 Safari/537.36",
+                    "Accept": "application/json",
+                    "Referer": "https://www.nseindia.com/",
+                }
+            )
 
             try:
                 session.get("https://www.nseindia.com", timeout=10)
             except Exception:
-                logger.warning("[SECTOR_SCAN] NSE homepage pre-request failed, continuing anyway")
+                logger.warning(
+                    "[SECTOR_SCAN] NSE homepage pre-request failed, continuing anyway"
+                )
 
             try:
                 res = session.get(
@@ -745,12 +1047,14 @@ class SectorMomentumBreakoutStrategy:
             sectors = []
             for item in res:
                 try:
-                    sectors.append({
-                        "scan_time":     scan_time,
-                        "sector":        item["index"],
-                        "sector_change": float(item["pChange"]),
-                        "status":        "ACTIVE",
-                    })
+                    sectors.append(
+                        {
+                            "scan_time": scan_time,
+                            "sector": item["index"],
+                            "sector_change": float(item["pChange"]),
+                            "status": "ACTIVE",
+                        }
+                    )
                 except (KeyError, ValueError) as e:
                     logger.warning(f"[SECTOR_SCAN] Skipping malformed sector item: {e}")
 
@@ -758,16 +1062,18 @@ class SectorMomentumBreakoutStrategy:
                 logger.warning("[SECTOR_SCAN] No sectors found")
                 return
 
-            sectors = sorted(sectors, key=lambda x: abs(x["sector_change"]), reverse=True)[:SECTOR_SCAN_LIMIT]
+            sectors = sorted(
+                sectors, key=lambda x: abs(x["sector_change"]), reverse=True
+            )[:SECTOR_SCAN_LIMIT]
             logger.info(f"[SECTOR_SCAN] Top {len(sectors)} sectors selected")
 
-            all_stocks    = []
+            all_stocks = []
             total_scanned = fno_reject = dir_reject = selected = 0
 
             for sector in sectors:
                 try:
                     sector_name = sector["sector"]
-                    formatted   = quote(sector_name)
+                    formatted = quote(sector_name)
                     url = (
                         f"https://www.nseindia.com/api/heatmap-symbols"
                         f"?type=Sectoral%20Indices&indices={formatted}"
@@ -778,7 +1084,9 @@ class SectorMomentumBreakoutStrategy:
                     try:
                         stocks = session.get(url, timeout=10).json()
                     except Exception:
-                        logger.exception(f"[SECTOR_SCAN] Failed to fetch stocks for {sector_name}")
+                        logger.exception(
+                            f"[SECTOR_SCAN] Failed to fetch stocks for {sector_name}"
+                        )
                         continue
 
                     for stock in stocks:
@@ -806,40 +1114,50 @@ class SectorMomentumBreakoutStrategy:
                                 dir_reject += 1
                                 continue
 
-                            all_stocks.append({
-                                "scan_time":       scan_time,
-                                "Sector":          sector_name,
-                                "Sector Change %": sector["sector_change"],
-                                "Symbol":          symbol,
-                                "Price":           float(stock["lastPrice"]),
-                                "Stock Change %":  stock_change,
-                                "status":          "ACTIVE",
-                            })
+                            all_stocks.append(
+                                {
+                                    "scan_time": scan_time,
+                                    "Sector": sector_name,
+                                    "Sector Change %": sector["sector_change"],
+                                    "Symbol": symbol,
+                                    "Price": float(stock["lastPrice"]),
+                                    "Stock Change %": stock_change,
+                                    "status": "ACTIVE",
+                                }
+                            )
                             selected += 1
                         except Exception:
-                            logger.exception(f"[SECTOR_SCAN] Error processing stock in {sector_name}")
+                            logger.exception(
+                                f"[SECTOR_SCAN] Error processing stock in {sector_name}"
+                            )
 
                 except Exception:
-                    logger.exception(f"[SECTOR_SCAN] Failed processing sector {sector.get('sector')}")
+                    logger.exception(
+                        f"[SECTOR_SCAN] Failed processing sector {sector.get('sector')}"
+                    )
 
             if not all_stocks:
                 logger.warning("[SECTOR_SCAN] No stocks matched criteria")
                 return
 
-            stocks_df     = pd.DataFrame(all_stocks)
+            stocks_df = pd.DataFrame(all_stocks)
             filtered_rows = []
             for sector_name, group in stocks_df.groupby("Sector"):
-                sc  = group["Sector Change %"].iloc[0]
+                sc = group["Sector Change %"].iloc[0]
                 top = (
-                    group.sort_values("Stock Change %", ascending=False).head(STOCK_SCAN_LIMIT)
+                    group.sort_values("Stock Change %", ascending=False).head(
+                        STOCK_SCAN_LIMIT
+                    )
                     if sc > 0
-                    else group.sort_values("Stock Change %", ascending=True).head(STOCK_SCAN_LIMIT)
+                    else group.sort_values("Stock Change %", ascending=True).head(
+                        STOCK_SCAN_LIMIT
+                    )
                 )
                 filtered_rows.append(top)
 
-            stocks_df               = pd.concat(filtered_rows, ignore_index=True)
+            stocks_df = pd.concat(filtered_rows, ignore_index=True)
             stocks_df["abs_sector"] = stocks_df["Sector Change %"].abs()
-            stocks_df["abs_stock"]  = stocks_df["Stock Change %"].abs()
+            stocks_df["abs_stock"] = stocks_df["Stock Change %"].abs()
             stocks_df = stocks_df.sort_values(
                 by=["abs_sector", "abs_stock"], ascending=[False, False]
             ).drop(columns=["abs_sector", "abs_stock"])
@@ -853,7 +1171,15 @@ class SectorMomentumBreakoutStrategy:
             self.update_csv_with_status(
                 "sectorwise_stocks_filtered.csv",
                 stocks_df,
-                ["scan_time", "Sector", "Sector Change %", "Symbol", "Price", "Stock Change %", "status"],
+                [
+                    "scan_time",
+                    "Sector",
+                    "Sector Change %",
+                    "Symbol",
+                    "Price",
+                    "Stock Change %",
+                    "status",
+                ],
             )
 
             logger.info(
@@ -862,7 +1188,9 @@ class SectorMomentumBreakoutStrategy:
                 f"Direction rejected: {dir_reject} | "
                 f"Selected: {selected}"
             )
-            logger.info(f"[SECTOR_SCAN] Completed at {self._now_ist().strftime('%Y-%m-%d %H:%M:%S')}")
+            logger.info(
+                f"[SECTOR_SCAN] Completed at {self._now_ist().strftime('%Y-%m-%d %H:%M:%S')}"
+            )
 
         except Exception:
             logger.exception("[SECTOR_SCAN] Fatal error in run_scrap_sector")
@@ -875,8 +1203,8 @@ class SectorMomentumBreakoutStrategy:
         logger.info(f"[BOT] Scheduler Started For User {user_profile.id}")
         logger.info("[BOT] Bot ACTIVE and waiting for Phase-1 start time")
 
-        phase1_executed       = False
-        phase2_active         = False
+        phase1_executed = False
+        phase2_active = False
         last_phase2_scan_slot = -1
 
         current_day = self._now_ist().date()
@@ -884,26 +1212,30 @@ class SectorMomentumBreakoutStrategy:
 
         while not self._is_stop_requested():
             try:
-                now          = self._now_ist()
-                today        = now.date()
+                now = self._now_ist()
+                today = now.date()
                 current_time = now.time()
 
                 # ---- Day rollover ----
                 if today != current_day:
-                    logger.info(f"[SCHEDULER] New trading day: {today}. Resetting flags.")
-                    current_day           = today
-                    phase1_executed       = False
-                    phase2_active         = False
+                    logger.info(
+                        f"[SCHEDULER] New trading day: {today}. Resetting flags."
+                    )
+                    current_day = today
+                    phase1_executed = False
+                    phase2_active = False
                     last_phase2_scan_slot = -1
-                    csv_cleaned           = False
+                    csv_cleaned = False
                     self._ws_phase1_started = False
                     self._ws_phase2_started = False
-                    self.trades_today     = 0
+                    self.trades_today = 0
                     if self.websocket_manager:
                         try:
                             self.websocket_manager.close_connection()
                         except Exception:
-                            logger.exception("[SCHEDULER] Error closing WS on day rollover")
+                            logger.exception(
+                                "[SCHEDULER] Error closing WS on day rollover"
+                            )
 
                 # ---- Clean CSVs once per day ----
                 if not csv_cleaned:
@@ -913,8 +1245,10 @@ class SectorMomentumBreakoutStrategy:
                 # ================================================
                 # PHASE 1  — executes ONCE
                 # ================================================
-                if (self._phase1_start <= current_time <= self._phase1_end
-                        and not phase1_executed):
+                if (
+                    self._phase1_start <= current_time <= self._phase1_end
+                    and not phase1_executed
+                ):
 
                     logger.info(f"[PHASE1] Started at {now.strftime('%H:%M:%S')}")
                     try:
@@ -938,11 +1272,11 @@ class SectorMomentumBreakoutStrategy:
                             try:
                                 creds = self._get_ws_credentials()
                                 self.websocket_manager.start(
-                                    angel        = angel,
-                                    settings     = settings,
-                                    user_profile = user_profile,
-                                    order_manager= self.order_manager,
-                                    strategy     = self,
+                                    angel=angel,
+                                    settings=settings,
+                                    user_profile=user_profile,
+                                    order_manager=self.order_manager,
+                                    strategy=self,
                                     **creds,
                                 )
                             except Exception:
@@ -950,8 +1284,8 @@ class SectorMomentumBreakoutStrategy:
                         self._ws_phase2_started = True
                         phase2_active = True
 
-                    interval_minutes  = self.PHASE2_SCAN_INTERVAL_MINUTES
-                    current_slot      = (now.hour * 60 + now.minute) // interval_minutes
+                    interval_minutes = self.PHASE2_SCAN_INTERVAL_MINUTES
+                    current_slot = (now.hour * 60 + now.minute) // interval_minutes
 
                     if now.second == 0 and current_slot != last_phase2_scan_slot:
                         last_phase2_scan_slot = current_slot
@@ -977,7 +1311,9 @@ class SectorMomentumBreakoutStrategy:
                             try:
                                 self.websocket_manager.unsubscribe_all()
                             except Exception:
-                                logger.exception("[SCHEDULER] Error unsubscribing on market close")
+                                logger.exception(
+                                    "[SCHEDULER] Error unsubscribing on market close"
+                                )
                     time.sleep(60)
 
                 else:
@@ -1011,47 +1347,320 @@ class SectorMomentumBreakoutStrategy:
                 df_today = df[df["scan_time"].dt.date == today]
                 if not df_today.empty:
                     all_stocks = df_today
-                    logger.info(f"[PHASE1] Found {len(all_stocks)} stocks on attempt {attempt + 1}")
+                    logger.info(
+                        f"[PHASE1] Found {len(all_stocks)} stocks on attempt {attempt + 1}"
+                    )
                     break
             except Exception:
-                logger.exception("[PHASE1] Error reading sectorwise_stocks_filtered.csv")
+                logger.exception(
+                    "[PHASE1] Error reading sectorwise_stocks_filtered.csv"
+                )
 
             if attempt < 2:
                 logger.warning(f"[PHASE1] No stocks found. Retry {attempt + 2}/3")
                 time.sleep(3)
 
         if all_stocks is None or all_stocks.empty:
-            logger.warning("[PHASE1] No stocks found after all retries — skipping Phase 1")
+            logger.warning(
+                "[PHASE1] No stocks found after all retries — skipping Phase 1"
+            )
             return
 
-        logger.info(f"[PHASE1] {len(all_stocks)} stocks found. Processing for watchlist.")
+        logger.info(
+            f"[PHASE1] {len(all_stocks)} stocks found. Processing for watchlist."
+        )
         self.process_stocks_for_monitoring(angel, settings, all_stocks, user_profile)
 
         logger.info(f"[PHASE1] Watchlist size: {len(self.watchlist)}")
 
         # ---- Start 1-min signal checker thread for Phase 1 watchlist ----
+        # NOTE: With immediate per-stock checkers now started inside
+        # process_stocks_for_monitoring() (see _phase1_checker_started_symbols),
+        # every entry that reaches the watchlist already has its own checker
+        # thread running by the time we get here. This block is left in place
+        # unmodified in structure as a safety-net: it will only start a
+        # checker for any ACTIVE entry that, for some reason, did not already
+        # get one started (e.g. legacy/edge path), preventing duplicate
+        # checkers for symbols already being polled.
         if os.path.exists(self.watchlist_csv):
             try:
                 wl_df = pd.read_csv(self.watchlist_csv)
                 active = wl_df[wl_df["status"] == "ACTIVE"]
                 if not active.empty:
-                    logger.info(
-                        f"[PHASE1] Starting 1-min signal checker for "
-                        f"{len(active)} active watchlist entries"
-                    )
-                    t = threading.Thread(
-                        target=self._phase1_signal_checker,
-                        args=(angel, settings, user_profile),
-                        daemon=True,
-                    )
-                    t.start()
+                    with self._phase1_checker_lock:
+                        already_started = set(self._phase1_checker_started_symbols)
+                    pending = active[~active["option_symbol"].isin(already_started)]
+                    if not pending.empty:
+                        logger.info(
+                            f"[PHASE1] Starting 1-min signal checker for "
+                            f"{len(pending)} active watchlist entries (fallback batch start)"
+                        )
+                        for _, row in pending.iterrows():
+                            opt_sym = row["option_symbol"]
+                            with self._phase1_checker_lock:
+                                if opt_sym in self._phase1_checker_started_symbols:
+                                    continue
+                                self._phase1_checker_started_symbols.add(opt_sym)
+                            t = threading.Thread(
+                                target=self._phase1_signal_checker_single,
+                                args=(angel, settings, user_profile, opt_sym),
+                                daemon=True,
+                            )
+                            t.start()
+                    else:
+                        logger.info(
+                            "[PHASE1] All active watchlist entries already have a "
+                            "running per-stock signal checker — nothing to start"
+                        )
                 else:
-                    logger.info("[PHASE1] No active watchlist entries — signal checker not started")
+                    logger.info(
+                        "[PHASE1] No active watchlist entries — signal checker not started"
+                    )
             except Exception:
-                logger.exception("[PHASE1] Error reading watchlist before starting signal checker")
+                logger.exception(
+                    "[PHASE1] Error reading watchlist before starting signal checker"
+                )
 
     # ===============================
-    # PHASE 1 — 1-MIN SIGNAL CHECKER
+    # PHASE 1 — 1-MIN SIGNAL CHECKER (PER-STOCK, IMMEDIATE START)
+    # ===============================
+    # NEW METHOD
+    # ---------------------------------------------------------------
+    # Polls option symbol 1-min candles for a SINGLE option_symbol.
+    # Trigger: latest completed 1-min close > stored five_min_high (option's
+    # 5-min candle high) — identical trigger logic to the original
+    # _phase1_signal_checker, just scoped to one symbol.
+    #
+    # WHY THIS EXISTS:
+    # The original design built the ENTIRE Phase 1 watchlist first (looping
+    # over every scanned stock, which can take 1-3 minutes due to OHLC
+    # rate-limit backoffs) and only THEN started a single shared checker
+    # thread for all watchlist entries. This meant the first stock added to
+    # the watchlist could sit unchecked for minutes before its first
+    # breakout poll, by which time option premium had already decayed.
+    #
+    # This method is started immediately (one thread per option symbol) the
+    # moment that symbol is added to the watchlist inside
+    # process_stocks_for_monitoring(), so breakout detection begins right
+    # away for that stock while the scan loop continues fetching OHLC data
+    # for subsequent stocks concurrently. Multiple per-stock threads can run
+    # at once without blocking each other or the main scan loop.
+    # ---------------------------------------------------------------
+
+    def _phase1_signal_checker_single(
+        self, angel, settings, user_profile, option_symbol
+    ):
+        """
+        Runs as a daemon thread immediately after a single watchlist entry
+        for `option_symbol` is created in Phase 1.
+
+        Polls 1-minute candles for this OPTION SYMBOL only:
+          - Trigger condition: latest completed 1-min candle close > five_min_high
+            (where five_min_high was stored from the option's own 5-min candle
+             at watchlist creation time)
+          - On trigger: calls order_manager to place order, marks entry INACTIVE
+
+        Polling interval: 60 seconds (aligned to 1-min candle close rhythm).
+        Stops when Phase 2 start time is reached, stop is requested, the
+        entry for this symbol is no longer ACTIVE in watchlist.csv, or no
+        active entry for this symbol exists.
+        """
+        logger.info(
+            f"[PHASE1 CHECKER] 1-min signal checker thread started for {option_symbol}"
+        )
+
+        instrument_list = self.order_manager.instrument_list
+
+        while not self._is_stop_requested():
+            now = self._now_ist()
+            current_time = now.time()
+
+            # Stop checker once Phase 2 begins
+            if current_time >= self._phase2_start:
+                logger.info(
+                    f"[PHASE1 CHECKER] Phase 2 start reached — stopping signal checker for {option_symbol}"
+                )
+                break
+
+            try:
+                if not os.path.exists(self.watchlist_csv):
+                    logger.info(
+                        f"[PHASE1 CHECKER] watchlist.csv not found — sleeping ({option_symbol})"
+                    )
+                    time.sleep(60)
+                    continue
+
+                wl_df = pd.read_csv(self.watchlist_csv)
+                active = wl_df[
+                    (wl_df["status"] == "ACTIVE")
+                    & (wl_df["option_symbol"] == option_symbol)
+                ]
+
+                if active.empty:
+                    logger.info(
+                        f"[PHASE1 CHECKER] No active entry remaining for {option_symbol} — stopping"
+                    )
+                    break
+
+                entry = active.iloc[0]
+                five_min_high = float(entry["five_min_high"])
+
+                logger.info(
+                    f"[PHASE1 CHECKER] Checking {option_symbol} at {now.strftime('%H:%M:%S')} | "
+                    f"five_min_high (option 5-min high)={five_min_high}"
+                )
+
+                one_min_data = self.get_todays_ohlc_data_(
+                    angel,
+                    option_symbol,
+                    interval="ONE_MINUTE",
+                    instrument_list=instrument_list,
+                    exchange="NFO",
+                )
+
+                if one_min_data is None or one_min_data.empty:
+                    logger.info(
+                        f"[PHASE1 CHECKER] No 1-min data for {option_symbol}, skipping"
+                    )
+                    time.sleep(60)
+                    continue
+
+                try:
+                    one_min_data["Timestamp"] = pd.to_datetime(
+                        one_min_data["Timestamp"], utc=True
+                    )
+                    one_min_data["Timestamp"] = one_min_data["Timestamp"].dt.tz_convert(
+                        IST
+                    )
+                    one_min_data = one_min_data.sort_values("Timestamp").reset_index(
+                        drop=True
+                    )
+
+                    today_date = now.date()
+                    today_candles = one_min_data[
+                        one_min_data["Timestamp"].dt.date == today_date
+                    ]
+
+                    if today_candles.empty:
+                        logger.info(
+                            f"[PHASE1 CHECKER] No today 1-min candles for {option_symbol}"
+                        )
+                        time.sleep(60)
+                        continue
+
+                    # Use latest completed candle only
+                    latest_1min = today_candles.iloc[-1]
+
+                    latest_close = float(latest_1min["close"])
+                    latest_ts = latest_1min["Timestamp"]
+
+                    logger.info(
+                        f"[PHASE1 CHECKER] {option_symbol} | "
+                        f"Latest 1-min close={latest_close} @ {latest_ts} | "
+                        f"five_min_high={five_min_high} | "
+                        f"Signal={'YES' if latest_close > five_min_high else 'NO'}"
+                    )
+
+                    # ---- TRIGGER CONDITION ----
+                    if latest_close > five_min_high:
+
+                        logger.info(
+                            f"[PHASE1 CHECKER] SIGNAL TRIGGERED for {option_symbol} | "
+                            f"1-min close ({latest_close}) > option 5-min high ({five_min_high})"
+                        )
+
+                        if self.trades_today >= self.max_trades_per_day:
+                            logger.info(
+                                f"[PHASE1 CHECKER] Trade limit reached "
+                                f"({self.trades_today}/{self.max_trades_per_day}), "
+                                f"skipping order for {option_symbol}"
+                            )
+                            break
+
+                        # ---- FIX: place order via the correct OrderManager
+                        # method. OrderManager has no place_order() method;
+                        # the real entry point is execute_trade(angel,
+                        # settings, entry_dict, user_profile), and it expects
+                        # the watchlist entry dict directly (it reads
+                        # entry['option_symbol'], entry['five_min_high'],
+                        # entry['stoploss'], etc.) rather than keyword args.
+                        try:
+                            result = self.order_manager.execute_trade(
+                                angel,
+                                settings,
+                                entry.to_dict(),
+                                user_profile,
+                            )
+                            success = result[0] if isinstance(result, tuple) else result
+
+                            if success:
+                                logger.info(
+                                    f"[PHASE1 CHECKER] Order placed for {option_symbol}"
+                                )
+                                self.increment_trade_count()
+                            else:
+                                logger.error(
+                                    f"[PHASE1 CHECKER] Order execution failed for {option_symbol}"
+                                )
+                        except Exception:
+                            logger.exception(
+                                f"[PHASE1 CHECKER] Error placing order for {option_symbol}"
+                            )
+
+                        # Mark entry INACTIVE in CSV
+                        try:
+                            updated_df = pd.read_csv(self.watchlist_csv)
+
+                            mask = (updated_df["option_symbol"] == option_symbol) & (
+                                updated_df["status"] == "ACTIVE"
+                            )
+
+                            updated_df.loc[mask, "status"] = "INACTIVE"
+
+                            updated_df.to_csv(self.watchlist_csv, index=False)
+
+                            logger.info(
+                                f"[PHASE1 CHECKER] Marked "
+                                f"{option_symbol} INACTIVE in watchlist"
+                            )
+
+                        except Exception:
+                            logger.exception(
+                                f"[PHASE1 CHECKER] Error marking "
+                                f"{option_symbol} INACTIVE"
+                            )
+
+                        # Trade resolved (placed or failed) — stop polling this symbol
+                        break
+
+                    else:
+                        logger.info(
+                            f"[PHASE1 CHECKER] No breakout found for "
+                            f"{option_symbol}"
+                        )
+
+                except Exception:
+                    logger.exception(
+                        f"[PHASE1 CHECKER] Error processing 1-min data for {option_symbol}"
+                    )
+
+            except Exception:
+                logger.exception(
+                    f"[PHASE1 CHECKER] Unexpected error in signal checker loop for {option_symbol}"
+                )
+
+            # Sleep 60s before next poll cycle
+            time.sleep(60)
+
+        with self._phase1_checker_lock:
+            self._phase1_checker_started_symbols.discard(option_symbol)
+
+        logger.info(
+            f"[PHASE1 CHECKER] Signal checker thread exiting for {option_symbol}"
+        )
+
+    # ===============================
+    # PHASE 1 — 1-MIN SIGNAL CHECKER (LEGACY BATCH VERSION — KEPT AS-IS)
     # Polls option symbol 1-min candles.
     # Trigger: latest completed 1-min close > stored five_min_high (option's 5-min candle high)
     # ===============================
@@ -1070,18 +1679,27 @@ class SectorMomentumBreakoutStrategy:
         Polling interval: 60 seconds (aligned to 1-min candle close rhythm).
         Stops when Phase 2 start time is reached, stop is requested, or
         no active entries remain.
+
+        NOTE: This batch-style checker is retained unmodified for reference /
+        fallback purposes. As of this update, Phase 1 normally uses the
+        per-stock _phase1_signal_checker_single() checkers started
+        immediately when each stock is added to the watchlist (see
+        process_stocks_for_monitoring), so breakout detection no longer waits
+        for the full scan loop to finish before the first poll occurs.
         """
         logger.info("[PHASE1 CHECKER] 1-min signal checker thread started")
 
         instrument_list = self.order_manager.instrument_list
 
         while not self._is_stop_requested():
-            now          = self._now_ist()
+            now = self._now_ist()
             current_time = now.time()
 
             # Stop checker once Phase 2 begins
             if current_time >= self._phase2_start:
-                logger.info("[PHASE1 CHECKER] Phase 2 start reached — stopping signal checker")
+                logger.info(
+                    "[PHASE1 CHECKER] Phase 2 start reached — stopping signal checker"
+                )
                 break
 
             try:
@@ -1094,7 +1712,9 @@ class SectorMomentumBreakoutStrategy:
                 active = wl_df[wl_df["status"] == "ACTIVE"]
 
                 if active.empty:
-                    logger.info("[PHASE1 CHECKER] No active entries remaining — stopping")
+                    logger.info(
+                        "[PHASE1 CHECKER] No active entries remaining — stopping"
+                    )
                     break
 
                 logger.info(
@@ -1136,10 +1756,14 @@ class SectorMomentumBreakoutStrategy:
                         one_min_data["Timestamp"] = pd.to_datetime(
                             one_min_data["Timestamp"], utc=True
                         )
-                        one_min_data["Timestamp"] = one_min_data["Timestamp"].dt.tz_convert(IST)
-                        one_min_data = one_min_data.sort_values("Timestamp").reset_index(drop=True)
+                        one_min_data["Timestamp"] = one_min_data[
+                            "Timestamp"
+                        ].dt.tz_convert(IST)
+                        one_min_data = one_min_data.sort_values(
+                            "Timestamp"
+                        ).reset_index(drop=True)
 
-                        today_date    = now.date()
+                        today_date = now.date()
                         today_candles = one_min_data[
                             one_min_data["Timestamp"].dt.date == today_date
                         ]
@@ -1150,7 +1774,7 @@ class SectorMomentumBreakoutStrategy:
                             )
                             continue
 
-                        # Use the latest completed candle
+                        # Use the latest completed candle only
                         # (last row — the most recently closed 1-min candle)
                         # latest_1min = today_candles.iloc[-1]
                         # latest_close = float(latest_1min["close"])
@@ -1213,8 +1837,6 @@ class SectorMomentumBreakoutStrategy:
                         #             f"[PHASE1 CHECKER] Error marking {option_symbol} INACTIVE"
                         #         )
 
-                        
-                        
                         # =====================================================
                         # CHECK ALL 1-MIN CANDLES FROM 09:20 ONWARDS
                         # Timestamp=09:20 => Candle 09:20-09:21
@@ -1273,17 +1895,12 @@ class SectorMomentumBreakoutStrategy:
                                 updated_df = pd.read_csv(self.watchlist_csv)
 
                                 mask = (
-                                    (updated_df["option_symbol"] == option_symbol)
-                                    &
-                                    (updated_df["status"] == "ACTIVE")
-                                )
+                                    updated_df["option_symbol"] == option_symbol
+                                ) & (updated_df["status"] == "ACTIVE")
 
                                 updated_df.loc[mask, "status"] = "INACTIVE"
 
-                                updated_df.to_csv(
-                                    self.watchlist_csv,
-                                    index=False
-                                )
+                                updated_df.to_csv(self.watchlist_csv, index=False)
 
                                 logger.info(
                                     f"[PHASE1 CHECKER] Marked "
@@ -1301,7 +1918,7 @@ class SectorMomentumBreakoutStrategy:
                                 f"[PHASE1 CHECKER] No breakout found for "
                                 f"{option_symbol}"
                             )
-                        
+
                     except Exception:
                         logger.exception(
                             f"[PHASE1 CHECKER] Error processing 1-min data for {option_symbol}"
@@ -1309,7 +1926,9 @@ class SectorMomentumBreakoutStrategy:
                         continue
 
             except Exception:
-                logger.exception("[PHASE1 CHECKER] Unexpected error in signal checker loop")
+                logger.exception(
+                    "[PHASE1 CHECKER] Unexpected error in signal checker loop"
+                )
 
             # Sleep 60s before next poll cycle
             time.sleep(60)
@@ -1346,9 +1965,22 @@ class SectorMomentumBreakoutStrategy:
           - No WebSocket subscription in Phase 1
 
         FIX: Added 1s inter-stock delay to reduce burst rate-limiting.
+
+        NEW (immediate breakout detection):
+          - The moment an entry is appended to the watchlist and saved to
+            CSV, a dedicated per-stock signal-checker thread
+            (_phase1_signal_checker_single) is started for that
+            option_symbol right away — it does not wait for this loop to
+            finish scanning the remaining stocks. This lets breakout
+            detection begin within seconds of a stock qualifying, while the
+            scan loop keeps evaluating the next stocks concurrently.
         """
-        logger.info(f"[PHASE1] Analyzing {len(stocks_data)} stocks for Phase 1 watchlist")
-        logger.info("[PHASE1] OHLC data will be fetched for UNDERLYING STOCK on NSE (not option contract)")
+        logger.info(
+            f"[PHASE1] Analyzing {len(stocks_data)} stocks for Phase 1 watchlist"
+        )
+        logger.info(
+            "[PHASE1] OHLC data will be fetched for UNDERLYING STOCK on NSE (not option contract)"
+        )
 
         if self.trades_today >= self.max_trades_per_day:
             logger.info(
@@ -1357,8 +1989,8 @@ class SectorMomentumBreakoutStrategy:
             return
 
         instrument_list = self.order_manager.instrument_list
-        symboldf        = self.order_manager.symboldf
-        processed       = added = 0
+        symboldf = self.order_manager.symboldf
+        processed = added = 0
 
         for stock_idx, (_, stock) in enumerate(stocks_data.iterrows()):
             if self._is_stop_requested():
@@ -1379,14 +2011,18 @@ class SectorMomentumBreakoutStrategy:
                     ex_df = pd.read_csv(self.watchlist_csv)
                     if "stock_symbol" in ex_df.columns:
                         already = ex_df[
-                            (ex_df["stock_symbol"] == symbol) &
-                            (ex_df["status"] == "ACTIVE")
+                            (ex_df["stock_symbol"] == symbol)
+                            & (ex_df["status"] == "ACTIVE")
                         ]
                         if not already.empty:
-                            logger.info(f"[PHASE1] {symbol} already in active watchlist, skipping")
+                            logger.info(
+                                f"[PHASE1] {symbol} already in active watchlist, skipping"
+                            )
                             continue
             except Exception:
-                logger.exception(f"[PHASE1] Error checking existing watchlist for {symbol}")
+                logger.exception(
+                    f"[PHASE1] Error checking existing watchlist for {symbol}"
+                )
 
             processed += 1
 
@@ -1399,8 +2035,11 @@ class SectorMomentumBreakoutStrategy:
                 f"[PHASE1] Fetching OHLC data for UNDERLYING STOCK: {symbol} on NSE exchange"
             )
             stock_candle_data = self.get_todays_ohlc_data_(
-                angel, symbol, interval="5",
-                instrument_list=instrument_list, exchange="NSE",
+                angel,
+                symbol,
+                interval="5",
+                instrument_list=instrument_list,
+                exchange="NSE",
             )
 
             if stock_candle_data is None or stock_candle_data.empty:
@@ -1411,23 +2050,39 @@ class SectorMomentumBreakoutStrategy:
                 stock_candle_data["Timestamp"] = pd.to_datetime(
                     stock_candle_data["Timestamp"], utc=True
                 )
-                stock_candle_data["Timestamp"] = stock_candle_data["Timestamp"].dt.tz_convert(IST)
-                stock_candle_data = stock_candle_data.sort_values("Timestamp").reset_index(drop=True)
+                stock_candle_data["Timestamp"] = stock_candle_data[
+                    "Timestamp"
+                ].dt.tz_convert(IST)
+                stock_candle_data = stock_candle_data.sort_values(
+                    "Timestamp"
+                ).reset_index(drop=True)
 
-                logger.info(f"[DEBUG] {symbol} Total stock candles={len(stock_candle_data)}")
-                logger.info(f"[DEBUG] {symbol} Timestamp dtype={stock_candle_data['Timestamp'].dtype}")
-                logger.info(f"[DEBUG] {symbol} First timestamp={stock_candle_data['Timestamp'].iloc[0]}")
-                logger.info(f"[DEBUG] {symbol} Last timestamp={stock_candle_data['Timestamp'].iloc[-1]}")
+                logger.info(
+                    f"[DEBUG] {symbol} Total stock candles={len(stock_candle_data)}"
+                )
+                logger.info(
+                    f"[DEBUG] {symbol} Timestamp dtype={stock_candle_data['Timestamp'].dtype}"
+                )
+                logger.info(
+                    f"[DEBUG] {symbol} First timestamp={stock_candle_data['Timestamp'].iloc[0]}"
+                )
+                logger.info(
+                    f"[DEBUG] {symbol} Last timestamp={stock_candle_data['Timestamp'].iloc[-1]}"
+                )
                 logger.info(
                     f"[DEBUG] {symbol} "
                     f"Unique dates={list(stock_candle_data['Timestamp'].dt.date.unique())[-10:]}"
                 )
 
-                today_date    = self._now_ist().date()
+                today_date = self._now_ist().date()
                 logger.info(f"[DEBUG] System today={today_date}")
 
-                today_candles = stock_candle_data[stock_candle_data["Timestamp"].dt.date == today_date]
-                prev_candles  = stock_candle_data[stock_candle_data["Timestamp"].dt.date < today_date]
+                today_candles = stock_candle_data[
+                    stock_candle_data["Timestamp"].dt.date == today_date
+                ]
+                prev_candles = stock_candle_data[
+                    stock_candle_data["Timestamp"].dt.date < today_date
+                ]
 
                 logger.info(f"[DEBUG] {symbol} today_date={today_date}")
                 logger.info(f"[DEBUG] {symbol} today_candles={len(today_candles)}")
@@ -1440,11 +2095,15 @@ class SectorMomentumBreakoutStrategy:
                     )
 
                 if today_candles.empty:
-                    logger.info(f"[PHASE1] No today candles for stock {symbol}, skipping")
+                    logger.info(
+                        f"[PHASE1] No today candles for stock {symbol}, skipping"
+                    )
                     continue
 
                 if prev_candles.empty:
-                    logger.info(f"[PHASE1] No previous day data for stock {symbol}, skipping")
+                    logger.info(
+                        f"[PHASE1] No previous day data for stock {symbol}, skipping"
+                    )
                     continue
 
                 logger.info(
@@ -1470,9 +2129,9 @@ class SectorMomentumBreakoutStrategy:
                     )
                     continue
 
-                prev_day_high  = float(last_day_df["high"].max())
-                prev_day_low   = float(last_day_df["low"].min())
-                prev_day_open  = float(last_day_df.iloc[0]["open"])
+                prev_day_high = float(last_day_df["high"].max())
+                prev_day_low = float(last_day_df["low"].min())
+                prev_day_open = float(last_day_df.iloc[0]["open"])
                 prev_day_close = float(last_day_df.iloc[-1]["close"])
 
                 high_candle = last_day_df.loc[last_day_df["high"].idxmax()]
@@ -1494,13 +2153,11 @@ class SectorMomentumBreakoutStrategy:
                 )
 
                 logger.info(
-                    f"[PREV_DAY_FIRST] {symbol} | "
-                    f"{last_day_df.iloc[0].to_dict()}"
+                    f"[PREV_DAY_FIRST] {symbol} | " f"{last_day_df.iloc[0].to_dict()}"
                 )
 
                 logger.info(
-                    f"[PREV_DAY_LAST] {symbol} | "
-                    f"{last_day_df.iloc[-1].to_dict()}"
+                    f"[PREV_DAY_LAST] {symbol} | " f"{last_day_df.iloc[-1].to_dict()}"
                 )
 
                 # ==========================================================
@@ -1509,7 +2166,7 @@ class SectorMomentumBreakoutStrategy:
                 # ==========================================================
 
                 first_candle = today_candles.iloc[0]
-                first_ts     = first_candle["Timestamp"]
+                first_ts = first_candle["Timestamp"]
 
                 logger.info(
                     f"[PHASE1] {symbol} | "
@@ -1522,8 +2179,7 @@ class SectorMomentumBreakoutStrategy:
 
                 # 20-day average volume from stock candles
                 historical_days = (
-                    prev_candles
-                    .groupby(prev_candles["Timestamp"].dt.date)["volume"]
+                    prev_candles.groupby(prev_candles["Timestamp"].dt.date)["volume"]
                     .sum()
                     .sort_index()
                 )
@@ -1539,9 +2195,7 @@ class SectorMomentumBreakoutStrategy:
 
                 avg_vol = float(last_20_days.mean())
 
-                volume_multiplier = float(
-                    settings.get("volume_multiplier", 1.0)
-                )
+                volume_multiplier = float(settings.get("volume_multiplier", 1.0))
 
                 req_vol = avg_vol * volume_multiplier
 
@@ -1560,13 +2214,11 @@ class SectorMomentumBreakoutStrategy:
                 # C1: Previous Day High < Today's First Candle Open
                 # c1 = prev_day_high < first_candle["open"]
 
-
                 # C2: Today's Volume >= Volume Multiplier × Avg20Volume
                 # c2 = float(first_candle["volume"]) >= req_vol
 
                 c1 = True
                 c2 = True
-
 
                 # C3: Green Candle (Close >= Open)
                 c3 = first_candle["close"] >= first_candle["open"]
@@ -1584,13 +2236,20 @@ class SectorMomentumBreakoutStrategy:
 
                 if not all([c1, c2, c3]):
                     failed = []
-                    if not c1: failed.append("PDH<OPEN")
-                    if not c2: failed.append("VOLUME")
-                    if not c3: failed.append("GREEN_CANDLE")
-                    logger.info(f"[PHASE1][REJECTED] {symbol} | Failed: {', '.join(failed)}")
+                    if not c1:
+                        failed.append("PDH<OPEN")
+                    if not c2:
+                        failed.append("VOLUME")
+                    if not c3:
+                        failed.append("GREEN_CANDLE")
+                    logger.info(
+                        f"[PHASE1][REJECTED] {symbol} | Failed: {', '.join(failed)}"
+                    )
                     continue
 
-                logger.info(f"[PHASE1][PASSED] {symbol} | All conditions passed on stock candle data")
+                logger.info(
+                    f"[PHASE1][PASSED] {symbol} | All conditions passed on stock candle data"
+                )
 
                 # ==========================================================
                 # STEP 2: After conditions pass — create OPTION SYMBOL
@@ -1611,7 +2270,13 @@ class SectorMomentumBreakoutStrategy:
                     f"after all conditions passed"
                 )
                 option_symbol = self.angel_fetch_symbol(
-                    angel, symbol, symbol, option_type, settings, instrument_list, symboldf
+                    angel,
+                    symbol,
+                    symbol,
+                    option_type,
+                    settings,
+                    instrument_list,
+                    symboldf,
                 )
                 if not option_symbol:
                     logger.warning(
@@ -1636,8 +2301,11 @@ class SectorMomentumBreakoutStrategy:
                 )
                 time.sleep(1)  # Small delay before option candle fetch
                 option_candle_data = self.get_todays_ohlc_data_(
-                    angel, option_symbol, interval="5",
-                    instrument_list=instrument_list, exchange="NFO",
+                    angel,
+                    option_symbol,
+                    interval="5",
+                    instrument_list=instrument_list,
+                    exchange="NFO",
                 )
 
                 if option_candle_data is None or option_candle_data.empty:
@@ -1649,10 +2317,14 @@ class SectorMomentumBreakoutStrategy:
                 option_candle_data["Timestamp"] = pd.to_datetime(
                     option_candle_data["Timestamp"], utc=True
                 )
-                option_candle_data["Timestamp"] = option_candle_data["Timestamp"].dt.tz_convert(IST)
-                option_candle_data = option_candle_data.sort_values("Timestamp").reset_index(drop=True)
+                option_candle_data["Timestamp"] = option_candle_data[
+                    "Timestamp"
+                ].dt.tz_convert(IST)
+                option_candle_data = option_candle_data.sort_values(
+                    "Timestamp"
+                ).reset_index(drop=True)
 
-# ========================Fetch latest 5 min candle for available option symbol================
+                # ========================Fetch latest 5 min candle for available option symbol================
                 # opt_today_candles = option_candle_data[
                 #     option_candle_data["Timestamp"].dt.date == today_date
                 # ]
@@ -1669,9 +2341,7 @@ class SectorMomentumBreakoutStrategy:
                 # option_five_min_low  = float(opt_first_candle["low"])
                 # option_five_min_close = float(opt_first_candle["close"])
                 # option_five_min_volume = float(opt_first_candle["volume"])
-                
-                
-                
+
                 opt_today_candles = option_candle_data[
                     option_candle_data["Timestamp"].dt.date == today_date
                 ]
@@ -1689,8 +2359,8 @@ class SectorMomentumBreakoutStrategy:
                 # =====================================================
 
                 target_915_candle = opt_today_candles[
-                    (opt_today_candles["Timestamp"].dt.hour == 9) &
-                    (opt_today_candles["Timestamp"].dt.minute == 15)
+                    (opt_today_candles["Timestamp"].dt.hour == 9)
+                    & (opt_today_candles["Timestamp"].dt.minute == 15)
                 ]
 
                 if target_915_candle.empty:
@@ -1725,20 +2395,20 @@ class SectorMomentumBreakoutStrategy:
                 # ==========================================================
 
                 entry = {
-                    "timestamp":         self._now_ist(),
-                    "option_symbol":     option_symbol,
-                    "stock_symbol":      symbol,
-                    "option_type":       option_type,
+                    "timestamp": self._now_ist(),
+                    "option_symbol": option_symbol,
+                    "stock_symbol": symbol,
+                    "option_type": option_type,
                     "previous_day_high": prev_day_high,
                     "previous_day_date": str(last_day),
-                    "five_min_high":     option_five_min_high,    # option's 5-min candle HIGH — trigger threshold
-                    "five_min_low":      option_five_min_low,     # option's 5-min candle LOW
-                    "five_min_close":    option_five_min_close,   # option's 5-min candle CLOSE
-                    "five_min_volume":   option_five_min_volume,  # option's 5-min candle VOLUME
-                    "avg_volume_20":     avg_vol,
-                    "entry_signal":      False,
-                    "status":            "ACTIVE",
-                    "stoploss":          option_five_min_low,     # stoploss = option's 5-min candle LOW
+                    "five_min_high": option_five_min_high,  # option's 5-min candle HIGH — trigger threshold
+                    "five_min_low": option_five_min_low,  # option's 5-min candle LOW
+                    "five_min_close": option_five_min_close,  # option's 5-min candle CLOSE
+                    "five_min_volume": option_five_min_volume,  # option's 5-min candle VOLUME
+                    "avg_volume_20": avg_vol,
+                    "entry_signal": False,
+                    "status": "ACTIVE",
+                    "stoploss": option_five_min_low,  # stoploss = option's 5-min candle LOW
                 }
 
                 self.watchlist.append(entry)
@@ -1753,11 +2423,46 @@ class SectorMomentumBreakoutStrategy:
 
                 self.save_watchlist_to_csv()
 
+                # ==========================================================
+                # NEW: IMMEDIATE PER-STOCK BREAKOUT CHECKER START
+                # Start polling THIS option symbol for breakout right away —
+                # do not wait for the remaining stocks in stocks_data to be
+                # scanned. This runs concurrently with the rest of this
+                # for-loop, so multiple stocks can be added to the watchlist
+                # and have their own checker threads running in parallel,
+                # each one accurate and immediate to its own add-time.
+                # ==========================================================
+                with self._phase1_checker_lock:
+                    already_running = (
+                        option_symbol in self._phase1_checker_started_symbols
+                    )
+                    if not already_running:
+                        self._phase1_checker_started_symbols.add(option_symbol)
+
+                if not already_running:
+                    logger.info(
+                        f"[PHASE1] Starting IMMEDIATE 1-min signal checker for "
+                        f"{option_symbol} (stock={symbol}) — not waiting for remaining scan"
+                    )
+                    checker_thread = threading.Thread(
+                        target=self._phase1_signal_checker_single,
+                        args=(angel, settings, user_profile, option_symbol),
+                        daemon=True,
+                    )
+                    checker_thread.start()
+                else:
+                    logger.info(
+                        f"[PHASE1] Signal checker already running for {option_symbol}, "
+                        f"not starting a duplicate"
+                    )
+
             except Exception:
                 logger.exception(f"[PHASE1] Error processing stock {symbol}")
                 continue
 
-        logger.info(f"[PHASE1] Processed {processed} stocks, added {added} to watchlist")
+        logger.info(
+            f"[PHASE1] Processed {processed} stocks, added {added} to watchlist"
+        )
 
     # ===============================
     # PHASE 2 — interval scan
@@ -1790,7 +2495,9 @@ class SectorMomentumBreakoutStrategy:
             time.sleep(3)
 
         if not scan_ok:
-            logger.warning("[PHASE2] Sector scan yielded no data, skipping this interval")
+            logger.warning(
+                "[PHASE2] Sector scan yielded no data, skipping this interval"
+            )
             return
 
         if self._is_stop_requested():
@@ -1806,20 +2513,26 @@ class SectorMomentumBreakoutStrategy:
         if t.is_alive():
             logger.warning("[PHASE2] Interval processing timed out (240s)")
 
-    def _process_interval_with_timeout(self, angel, settings, current_time, user_profile):
+    def _process_interval_with_timeout(
+        self, angel, settings, current_time, user_profile
+    ):
         try:
-            logger.info(f"[PHASE2] Processing interval {current_time.strftime('%H:%M')}")
+            logger.info(
+                f"[PHASE2] Processing interval {current_time.strftime('%H:%M')}"
+            )
 
             if self.trades_today >= self.max_trades_per_day:
                 logger.info("[PHASE2] Trade limit reached, skipping interval")
                 return
 
             stocks_df = pd.read_csv("sectorwise_stocks_filtered.csv")
-            today     = self._now_ist().date()
-            stocks_df["scan_time"] = pd.to_datetime(stocks_df["scan_time"], errors="coerce")
+            today = self._now_ist().date()
+            stocks_df["scan_time"] = pd.to_datetime(
+                stocks_df["scan_time"], errors="coerce"
+            )
             active = stocks_df[
-                (stocks_df["status"] == "ACTIVE") &
-                (stocks_df["scan_time"].dt.date == today)
+                (stocks_df["status"] == "ACTIVE")
+                & (stocks_df["scan_time"].dt.date == today)
             ]
 
             if active.empty:
@@ -1834,25 +2547,33 @@ class SectorMomentumBreakoutStrategy:
                 if stock_idx > 0:
                     time.sleep(1)
                 try:
-                    self.process_stock_for_phase2(angel, settings, stock, current_time, user_profile)
+                    self.process_stock_for_phase2(
+                        angel, settings, stock, current_time, user_profile
+                    )
                 except Exception:
-                    logger.exception(f"[PHASE2] Error processing stock {stock.get('Symbol')}")
+                    logger.exception(
+                        f"[PHASE2] Error processing stock {stock.get('Symbol')}"
+                    )
 
-            logger.info(f"[PHASE2] Interval processing complete for {current_time.strftime('%H:%M')}")
+            logger.info(
+                f"[PHASE2] Interval processing complete for {current_time.strftime('%H:%M')}"
+            )
 
         except Exception:
             logger.exception("[PHASE2] Interval processing error")
 
-    def process_stock_for_phase2(self, angel, settings, stock, current_time, user_profile):
+    def process_stock_for_phase2(
+        self, angel, settings, stock, current_time, user_profile
+    ):
         if self.trades_today >= self.max_trades_per_day:
             logger.info(f"[PHASE2] Trade limit reached, skipping {stock['Symbol']}")
             return
 
-        symbol      = stock["Symbol"]
+        symbol = stock["Symbol"]
         option_type = "CE" if float(stock["Stock Change %"]) > 0 else "PE"
 
         instrument_list = self.order_manager.instrument_list
-        symboldf        = self.order_manager.symboldf
+        symboldf = self.order_manager.symboldf
 
         option_symbol = self.angel_fetch_symbol(
             angel, symbol, symbol, option_type, settings, instrument_list, symboldf
@@ -1866,32 +2587,42 @@ class SectorMomentumBreakoutStrategy:
             if os.path.exists(self.watchlist_csv2):
                 w2_df = pd.read_csv(self.watchlist_csv2)
                 already = w2_df[
-                    (w2_df["stock_symbol"] == symbol) &
-                    (w2_df["status"] == "ACTIVE") &
-                    (pd.to_datetime(w2_df["timestamp"]).dt.date == current_time.date())
+                    (w2_df["stock_symbol"] == symbol)
+                    & (w2_df["status"] == "ACTIVE")
+                    & (
+                        pd.to_datetime(w2_df["timestamp"]).dt.date
+                        == current_time.date()
+                    )
                 ]
                 if not already.empty:
-                    logger.info(f"[PHASE2] {symbol} already in active watchlist2, skipping")
+                    logger.info(
+                        f"[PHASE2] {symbol} already in active watchlist2, skipping"
+                    )
                     return
         except Exception:
             pass
 
         candle_data = self.get_todays_ohlc_data_(
-            angel, option_symbol, interval="5",
-            instrument_list=instrument_list, exchange="NFO",
+            angel,
+            option_symbol,
+            interval="5",
+            instrument_list=instrument_list,
+            exchange="NFO",
         )
         if candle_data is None or candle_data.empty:
             logger.info(f"[PHASE2] No candle data for {option_symbol}")
             return
 
         try:
-            candle_data["Timestamp"] = pd.to_datetime(candle_data["Timestamp"], utc=True)
+            candle_data["Timestamp"] = pd.to_datetime(
+                candle_data["Timestamp"], utc=True
+            )
             candle_data["Timestamp"] = candle_data["Timestamp"].dt.tz_convert(IST)
             candle_data = candle_data.sort_values("Timestamp").reset_index(drop=True)
 
-            today_date    = current_time.date()
+            today_date = current_time.date()
             today_candles = candle_data[candle_data["Timestamp"].dt.date == today_date]
-            prev_candles  = candle_data[candle_data["Timestamp"].dt.date < today_date]
+            prev_candles = candle_data[candle_data["Timestamp"].dt.date < today_date]
 
             if today_candles.empty:
                 logger.info(f"[PHASE2] No today candles for {option_symbol}")
@@ -1901,9 +2632,11 @@ class SectorMomentumBreakoutStrategy:
                 logger.info(f"[PHASE2] No previous day data for {option_symbol}")
                 return
 
-            last_day         = prev_candles["Timestamp"].dt.date.max()
-            last_day_candles = prev_candles[prev_candles["Timestamp"].dt.date == last_day]
-            prev_day_high    = last_day_candles["high"].max()
+            last_day = prev_candles["Timestamp"].dt.date.max()
+            last_day_candles = prev_candles[
+                prev_candles["Timestamp"].dt.date == last_day
+            ]
+            prev_day_high = last_day_candles["high"].max()
 
             target_ts = pd.Timestamp(
                 current_time.replace(second=0, microsecond=0)
@@ -1918,13 +2651,15 @@ class SectorMomentumBreakoutStrategy:
                 )
                 current_candle = today_candles.tail(1)
 
-            latest            = current_candle.iloc[0]
+            latest = current_candle.iloc[0]
             current_candle_ts = latest["Timestamp"]
 
             candles_up_to = candle_data[candle_data["Timestamp"] <= current_candle_ts]
-            recent_20     = candles_up_to.tail(20) if len(candles_up_to) >= 20 else candles_up_to
-            avg_volume    = round(float(recent_20["volume"].mean()))
-            req_volume    = float(settings.get("volume_multiplier", 1.0)) * avg_volume
+            recent_20 = (
+                candles_up_to.tail(20) if len(candles_up_to) >= 20 else candles_up_to
+            )
+            avg_volume = round(float(recent_20["volume"].mean()))
+            req_volume = float(settings.get("volume_multiplier", 1.0)) * avg_volume
 
             logger.info(
                 f"[PHASE2] {symbol} | Vol: {latest['volume']:.0f} | "
@@ -1936,29 +2671,32 @@ class SectorMomentumBreakoutStrategy:
                 return
 
             # VWAP & WMA-9
-            today_vwap_df = today_candles[
-                today_candles["Timestamp"] <= current_candle_ts
-            ].copy().set_index("Timestamp").sort_index()
+            today_vwap_df = (
+                today_candles[today_candles["Timestamp"] <= current_candle_ts]
+                .copy()
+                .set_index("Timestamp")
+                .sort_index()
+            )
 
             if today_vwap_df.empty:
                 logger.info(f"[PHASE2] Insufficient data for VWAP for {symbol}")
                 return
 
             current_vwap = None
-            current_wma  = None
+            current_wma = None
 
             try:
                 vwap_result = pd_ta.vwap(
-                    high   = today_vwap_df["high"],
-                    low    = today_vwap_df["low"],
-                    close  = today_vwap_df["close"],
-                    volume = today_vwap_df["volume"],
+                    high=today_vwap_df["high"],
+                    low=today_vwap_df["low"],
+                    close=today_vwap_df["close"],
+                    volume=today_vwap_df["volume"],
                 )
                 today_vwap_df["vwap"] = vwap_result
 
                 needed_for_wma = 9
-                today_count    = len(today_vwap_df)
-                extra_needed   = needed_for_wma - today_count
+                today_count = len(today_vwap_df)
+                extra_needed = needed_for_wma - today_count
 
                 if extra_needed > 0 and not last_day_candles.empty:
                     prev_sorted = (
@@ -1973,8 +2711,10 @@ class SectorMomentumBreakoutStrategy:
 
                 if len(combined) >= needed_for_wma:
                     wma_series = pd_ta.wma(combined["close"], length=needed_for_wma)
-                    last_wma   = wma_series.iloc[-1]
-                    current_wma = round(float(last_wma), 2) if not pd.isna(last_wma) else None
+                    last_wma = wma_series.iloc[-1]
+                    current_wma = (
+                        round(float(last_wma), 2) if not pd.isna(last_wma) else None
+                    )
 
                 if current_candle_ts in today_vwap_df.index:
                     raw = today_vwap_df.loc[current_candle_ts, "vwap"]
@@ -1997,8 +2737,12 @@ class SectorMomentumBreakoutStrategy:
             c2 = latest["volume"] > req_volume
             c3 = latest["close"] >= latest["open"]
             c4 = current_vwap is not None and latest["close"] > current_vwap
-            c5 = current_wma  is not None and latest["close"] > current_wma
-            c6 = current_wma  is not None and current_vwap is not None and current_vwap < current_wma
+            c5 = current_wma is not None and latest["close"] > current_wma
+            c6 = (
+                current_wma is not None
+                and current_vwap is not None
+                and current_vwap < current_wma
+            )
 
             logger.info(
                 f"[CONDITION] C1(PDH<open)={c1} C2(vol)={c2} C3(green)={c3} "
@@ -2006,31 +2750,33 @@ class SectorMomentumBreakoutStrategy:
             )
 
             if not all([c1, c2, c3, c4, c5, c6]):
-                failed = [f"C{i+1}" for i, c in enumerate([c1, c2, c3, c4, c5, c6]) if not c]
+                failed = [
+                    f"C{i+1}" for i, c in enumerate([c1, c2, c3, c4, c5, c6]) if not c
+                ]
                 logger.info(f"[CONDITION] FAILED {failed} for {symbol}")
                 return
 
             logger.info(f"[CONDITION] ALL CONDITIONS MET for {symbol}")
 
             limit_multiplier = float(settings.get("limit_multiplier", 1.0))
-            limit_price      = round(float(latest["high"]) * limit_multiplier, 2)
+            limit_price = round(float(latest["high"]) * limit_multiplier, 2)
 
             watchlist_entry = {
-                "timestamp":       timezone.localtime(timezone.now()),
-                "option_symbol":   option_symbol,
-                "stock_symbol":    symbol,
-                "option_type":     option_type,
-                "five_min_high":   float(latest["high"]),
-                "five_min_low":    float(latest["low"]),
-                "five_min_close":  float(latest["close"]),
+                "timestamp": timezone.localtime(timezone.now()),
+                "option_symbol": option_symbol,
+                "stock_symbol": symbol,
+                "option_type": option_type,
+                "five_min_high": float(latest["high"]),
+                "five_min_low": float(latest["low"]),
+                "five_min_close": float(latest["close"]),
                 "five_min_volume": float(latest["volume"]),
-                "avg_volume_20":   avg_volume,
-                "vwap":            current_vwap,
-                "wma_9":           current_wma,
-                "entry_signal":    True,
-                "status":          "ACTIVE",
-                "limit_price":     limit_price,
-                "stoploss":        float(latest["low"]),
+                "avg_volume_20": avg_volume,
+                "vwap": current_vwap,
+                "wma_9": current_wma,
+                "entry_signal": True,
+                "status": "ACTIVE",
+                "limit_price": limit_price,
+                "stoploss": float(latest["low"]),
             }
 
             self.watchlist2.append(watchlist_entry)
@@ -2042,10 +2788,10 @@ class SectorMomentumBreakoutStrategy:
             if self.websocket_manager:
                 try:
                     self.websocket_manager.subscribe_token(
-                        symbol          = option_symbol,
-                        limit_price     = limit_price,
-                        row_data        = watchlist_entry,
-                        instrument_list = instrument_list,
+                        symbol=option_symbol,
+                        limit_price=limit_price,
+                        row_data=watchlist_entry,
+                        instrument_list=instrument_list,
                     )
                     logger.info(f"[SUBSCRIBE] {option_symbol} subscribed via WebSocket")
                 except Exception:
@@ -2060,4 +2806,6 @@ class SectorMomentumBreakoutStrategy:
 
     def increment_trade_count(self):
         self.trades_today += 1
-        logger.info(f"[ORDER] Trade counter: {self.trades_today}/{self.max_trades_per_day}")
+        logger.info(
+            f"[ORDER] Trade counter: {self.trades_today}/{self.max_trades_per_day}"
+        )
