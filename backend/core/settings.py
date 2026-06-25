@@ -1,5 +1,3 @@
-
-
 from pathlib import Path
 from datetime import timedelta
 from dotenv import load_dotenv
@@ -15,9 +13,13 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 SECRET_KEY = "django-insecure-y&zxrvo(r9eye1*=48azf^=%g)412tw3v)*rm=*-(+2eg)fkjo"
 
 # SECURITY WARNING: don't run with debug turned on in production!
-DEBUG = True
+DEBUG = False
 
-ALLOWED_HOSTS = []
+ALLOWED_HOSTS = [
+    "3.208.8.86",
+    "localhost",
+    "127.0.0.1",
+]
 
 
 # Application definition
