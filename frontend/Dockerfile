@@ -23,7 +23,7 @@ WORKDIR /app
 
 COPY --from=builder /app/package*.json ./
 
-RUN npm ci --omit=dev
+RUN npm ci
 
 COPY --from=builder /app/dist ./dist
 
