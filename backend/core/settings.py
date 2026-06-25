@@ -2,7 +2,8 @@
 
 from pathlib import Path
 from datetime import timedelta
-
+from dotenv import load_dotenv
+load_dotenv()
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
 
@@ -188,3 +189,9 @@ ANGEL_API_KEY = os.getenv("ANGEL_API_KEY")
 ANGEL_CLIENT_CODE = os.getenv("ANGEL_CLIENT_CODE")
 ANGEL_JWT_TOKEN = os.getenv("ANGEL_JWT_TOKEN")
 ANGEL_FEED_TOKEN = os.getenv("ANGEL_FEED_TOKEN")
+
+
+# print("API_KEY =", ANGEL_API_KEY)
+# print("CLIENT_CODE =", ANGEL_CLIENT_CODE)
+# print("JWT =", ANGEL_JWT_TOKEN)
+# print("FEED =", ANGEL_FEED_TOKEN)
